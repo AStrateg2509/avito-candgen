@@ -12,6 +12,14 @@ bash scripts/setup_data.sh   # распаковка data/raw/dataset.zip (иде
 bash scripts/check_env.sh    # отчёт о среде: GPU, RAM, версии, CUDA
 ```
 
+Анализ данных и валидация (из корня, после `source scripts/env.sh`):
+
+```bash
+python -m candgen.eda                        # reports/eda.md + reports/fig/*.png
+python -m candgen.validation --build         # срезы валидации -> artifacts/val_*
+python -m candgen.validation --selftest      # проверка метрики и детерминизма срезов
+```
+
 Все скрипты сами подключают `scripts/env.sh`: venv, `PYTHONPATH=src`, `PYTHONHASHSEED=42`, offline-режим HuggingFace. Модули запускаются как `python -m candgen.<модуль> --config configs/default.yaml`.
 
 Разработка велась из Windows: Claude Code/VS Code в Windows, вычисления в WSL2 Ubuntu. Команды проходят через мост `w.cmd` (см. `CLAUDE.md`). Для запуска на Linux он не нужен.
