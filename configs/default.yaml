@@ -1,0 +1,21 @@
+# Единственное место с путями и гиперпараметрами проекта.
+# Все пути относительные — от корня репозитория.
+
+seed: 42
+n_jobs: 14          # потоков CPU для sklearn/lightgbm и т.п.
+
+paths:
+  raw_dir: data/raw
+  train: data/raw/train.parquet
+  queries: data/raw/benchmark_queries.parquet
+  items: data/raw/benchmark_items.parquet
+  artifacts_dir: artifacts
+  reports_dir: reports
+  answer: answer.csv
+
+# Контроль целостности сырых данных (python -m candgen.io --describe).
+data_check:
+  expected_rows:
+    train: 497673
+    queries: 2452
+    items: 189212

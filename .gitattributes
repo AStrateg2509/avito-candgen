@@ -1,0 +1,12 @@
+# Все текстовые файлы в репозитории храним и выгружаем с LF (скрипты
+# запускаются в Linux/WSL).
+* text=auto eol=lf
+# Исключение: batch-файлы Windows должны иметь CRLF, иначе cmd.exe
+# может неверно разбирать строки.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+# Бинарные артефакты.
+*.parquet binary
+*.png binary
+*.npy binary
+*.zip binary
