@@ -372,6 +372,31 @@ def load_val(cfg: dict, variant: str = "ctx") -> ValSet:
     return ValSet(variant, q, rel_sets, rest_sets, meta, vcfg["k"], vcfg["min_cell_n"])
 
 
+def subset_val(val: ValSet, query_ids: set[str]) -> ValSet:
+    """Подмножество валидации (например, половина для честной проверки подбора весов).
+
+    Вход: ValSet и множество query_id. Выход: новый ValSet только с этими запросами.
+    """
+    q = val.queries[val.queries["query_id"].isin(query_ids)].reset_index(drop=True)
+    keep = set(q["query_id"])
+    return ValSet(val.variant, q, {k: v for k, v in val.rel.items() if k in keep},
+                  {k: v for k, v in val.rel_in_rest.items() if k in keep}, val.meta, val.k, val.min_cell_n)
+
+
+def split_halves(val: ValSet, seed: int) -> tuple[set[str], set[str]]:
+    """Делит запросы валидации на две половины, стратифицируя по ячейкам.
+
+    Вход: ValSet, seed. Выход: (query_id половины A, query_id половины B).
+    """
+    rng = np.random.default_rng(seed)
+    a, b = set(), set()
+    for _, grp in val.queries.groupby("cell", sort=True):
+        ids = rng.permutation(np.sort(grp["query_id"].to_numpy()))
+        a.update(ids[: len(ids) // 2])
+        b.update(ids[len(ids) // 2:])
+    return a, b
+
+
 def load_train_rest_mask(cfg: dict, variant: str = "ctx") -> np.ndarray:
     """Булева маска «строка train входит в обучающий остаток» для варианта.
 

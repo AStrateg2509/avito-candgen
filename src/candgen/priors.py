@@ -1,0 +1,208 @@
+"""Приоры, не зависящие от текста объявления: локация, подкатегория, фильтр.
+
+Все приоры считаются только по переданной части train: на валидации это
+остаток (без отложенных строк), на сабмите — весь train.
+
+  * LocationPrior — матрица переходов P(item_loc | search_loc) по кликам.
+    В корпусе нет объявлений в 17% локаций поиска (регионы-агрегаты), поэтому
+    сравнивать локации на равенство нельзя, нужна именно матрица переходов;
+  * MicrocatPrior — P(подкатегория | запрос) через kNN по похожим текстам
+    запросов train (char 2–4 TF-IDF): 86% кликов запроса приходятся на его
+    главную подкатегорию;
+  * FilterPrior — бонус, если значение «Вид услуги» / «Тип услуги» из фильтра
+    поиска есть в параметрах объявления (у выбранных — в 98% случаев).
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
+import torch
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+from candgen.text import compile_filter_keys, parse_filters
+from candgen.torch_utils import dense_batch_T, to_torch_csr
+
+
+class LocationPrior:
+    """P(item_loc | search_loc) по частоте кликов в train.
+
+    Для локации поиска, которой нет в train, берётся запасной вариант из
+    конфига: 'self' — вся масса на ту же локацию (если в корпусе она есть),
+    'uniform' — равномерно по локациям корпуса.
+    """
+
+    def __init__(self, loc_cfg: dict):
+        """Вход: секция priors.loc конфига."""
+        self.fallback = loc_cfg["fallback"]
+        self.counts: pd.Series | None = None
+
+    def fit(self, train: pd.DataFrame) -> "LocationPrior":
+        """Считает число кликов для каждой пары (search_location_id, item_location_id)."""
+        self.counts = train.groupby(["search_location_id", "item_location_id"]).size()
+        return self
+
+    def matrix(self, query_locs: np.ndarray, item_locs: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+        """Плотная матрица P для локаций запросов (строки) и локаций корпуса (столбцы).
+
+        Строка нормирована по ВСЕМ локациям объявлений в train, поэтому масса,
+        ушедшая в локации без объявлений корпуса, теряется честно, без перенормировки.
+
+        Вход: локации запросов и объявлений корпуса (с повторами).
+        Выход: (P float32 [n_uq × n_ui], уникальные локации запросов,
+                уникальные локации корпуса, число локаций с запасным вариантом).
+        """
+        uq, ui = np.unique(query_locs), np.unique(item_locs)
+        qpos = pd.Series(np.arange(len(uq)), index=uq)
+        ipos = pd.Series(np.arange(len(ui)), index=ui)
+        P = np.zeros((len(uq), len(ui)), dtype=np.float32)
+
+        df = self.counts.rename("n").reset_index()
+        totals = df.groupby("search_location_id")["n"].sum()
+        df = df[df["search_location_id"].isin(qpos.index) & df["item_location_id"].isin(ipos.index)]
+        P[qpos.loc[df["search_location_id"]].to_numpy(), ipos.loc[df["item_location_id"]].to_numpy()] = (
+            df["n"].to_numpy() / totals.loc[df["search_location_id"]].to_numpy())
+
+        missing = [loc for loc in uq if loc not in totals.index]
+        for loc in missing:
+            if self.fallback == "self" and loc in ipos.index:
+                P[qpos[loc], ipos[loc]] = 1.0
+            else:
+                P[qpos[loc], :] = 1.0 / len(ui)
+        return P, uq, ui, len(missing)
+
+
+class MicrocatPrior:
+    """P(подкатегория | запрос): взвешенная смесь распределений k ближайших текстов train.
+
+    Тексты train (нормализованные, уникальные) представлены char 2–4 TF-IDF.
+    Для каждого запроса ищутся k самых похожих по косинусу, их распределения
+    кликов по подкатегориям смешиваются с весами sim**power. Seen-запрос
+    находит сам себя (sim = 1) и получает в основном собственную историю.
+    """
+
+    def __init__(self, mc_cfg: dict, device: torch.device):
+        """Вход: секция priors.mc конфига и устройство для kNN."""
+        self.cfg = mc_cfg
+        self.device = device
+
+    def fit(self, train: pd.DataFrame, mc_index: np.ndarray) -> "MicrocatPrior":
+        """Строит распределения подкатегорий по текстам и TF-IDF текстов.
+
+        Вход: train с query_norm и item_microcat_id; подкатегории корпуса
+              (столбцы результата). Клики в подкатегории вне корпуса не учитываются.
+        """
+        self.mc_index = mc_index
+        mpos = pd.Series(np.arange(len(mc_index)), index=mc_index)
+        tr = train[train["item_microcat_id"].isin(mpos.index) & (train["query_norm"] != "")]
+        cnt = tr.groupby(["query_norm", "item_microcat_id"]).size().rename("n").reset_index()
+        self.texts = np.sort(cnt["query_norm"].unique())
+        tpos = pd.Series(np.arange(len(self.texts)), index=self.texts)
+        D = np.zeros((len(self.texts), len(mc_index)), dtype=np.float32)
+        np.add.at(D, (tpos.loc[cnt["query_norm"]].to_numpy(), mpos.loc[cnt["item_microcat_id"]].to_numpy()),
+                  cnt["n"].to_numpy(dtype=np.float32))
+        self.D = D / D.sum(axis=1, keepdims=True)
+        self.vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=tuple(self.cfg["ngram_range"]),
+                                          sublinear_tf=True, dtype=np.float32)
+        self.T = self.vectorizer.fit_transform(self.texts)
+        return self
+
+    def predict(self, query_texts: list[str], batch_size: int = 512) -> np.ndarray:
+        """Распределение подкатегорий для каждого запроса.
+
+        Вход: нормализованные тексты запросов.
+        Выход: float32 [n_q × n_mc], строки суммируются в 1. Если у запроса нет
+               ни одного похожего текста (все sim = 0), строка равномерная.
+        """
+        k, power = self.cfg["k"], self.cfg["power"]
+        Q = self.vectorizer.transform(query_texts)
+        T = to_torch_csr(self.T, self.device)
+        D = torch.from_numpy(self.D).to(self.device)
+        out = np.empty((len(query_texts), D.shape[1]), dtype=np.float32)
+        for start in range(0, len(query_texts), batch_size):
+            rows = slice(start, min(start + batch_size, len(query_texts)))
+            sims = torch.sparse.mm(T, dense_batch_T(Q, rows, self.device))  # n_texts × B
+            vals, idx = torch.topk(sims, k, dim=0)                          # k × B
+            w = vals.clamp(min=0) ** power
+            P = torch.einsum("kb,kbm->bm", w, D[idx])                      # B × n_mc
+            s = w.sum(dim=0)
+            P = torch.where(s[:, None] > 0, P / s.clamp(min=1e-12)[:, None],
+                            torch.full_like(P, 1.0 / D.shape[1]))
+            out[rows] = P.cpu().numpy()
+        return out
+
+
+class FilterPrior:
+    """Бонус за совпадение фильтра поиска с параметрами объявления.
+
+    Для каждого главного ключа (Вид услуги, Тип услуги) с непустым значением
+    объявление получает вес ключа, если в его параметрах есть подстрока
+    «ключ значение» (match: pair) или просто «значение» (match: value).
+    Итоговый бонус запроса = Σ вес_ключа · [совпало] ∈ [0, 1].
+    """
+
+    # Сколько символов после «ключ » сохраняем для поиска значения (значения
+    # «Вид/Тип услуги» короче 100 символов).
+    TAIL_WIDTH = 150
+    SEP = "\x00"
+
+    def __init__(self, filters_cfg: dict, filter_cfg: dict):
+        """Вход: секция filters (список ключей) и priors.filter конфига."""
+        self.pattern = compile_filter_keys(filters_cfg["keys"])
+        self.key_weights = filter_cfg["key_weights"]
+        self.match = filter_cfg["match"]
+        self._cache: dict[tuple[str, str], np.ndarray] = {}
+        self._tails: dict[str, pa.Array] = {}
+
+    def _key_tails(self, key: str, item_params: list[str]) -> pa.Array:
+        """Для каждого объявления — склейка фрагментов, идущих сразу после «ключ ».
+
+        Каждый фрагмент начинается с разделителя SEP, поэтому проверка
+        «SEP + значение ⊂ хвосты» равносильна «в параметрах есть «ключ значение»»,
+        но ищем в ~20 МБ хвостов, а не в ~180 МБ параметров: в разы быстрее.
+        """
+        if key not in self._tails:
+            prefix, out = key + " ", []
+            for p in item_params:
+                parts, start = [], p.find(prefix)
+                while start != -1:
+                    s = start + len(prefix)
+                    parts.append(self.SEP + p[s:s + self.TAIL_WIDTH])
+                    start = p.find(prefix, s)
+                out.append("".join(parts))
+            self._tails[key] = pa.array(out)
+        return self._tails[key]
+
+    def build(self, filter_texts: list[str], item_params: list[str]) -> tuple[np.ndarray, np.ndarray, list[str]]:
+        """Матрица весов «запрос × пара» и матрица совпадений «пара × объявление».
+
+        Бонус запросов = W @ F. Поиск подстроки идёт векторно в arrow
+        (pc.match_substring), результаты кэшируются по паре (ключ, значение).
+
+        Вход: тексты фильтров запросов; параметры объявлений корпуса (список строк).
+        Выход: (W float32 [n_q × n_pairs], F bool [n_pairs × N], список пар «ключ значение»).
+        """
+        pairs: dict[tuple[str, str], int] = {}
+        entries = []  # (строка запроса, номер пары, вес)
+        for qi, text in enumerate(filter_texts):
+            for key, value in parse_filters(text, self.pattern):
+                if key in self.key_weights and value:
+                    pid = pairs.setdefault((key, value), len(pairs))
+                    entries.append((qi, pid, self.key_weights[key]))
+        W = np.zeros((len(filter_texts), max(len(pairs), 1)), dtype=np.float32)
+        for qi, pid, w in entries:
+            W[qi, pid] = w  # повтор того же ключа не суммируется
+        F = np.zeros((max(len(pairs), 1), len(item_params)), dtype=bool)
+        full = None
+        for (key, value), pid in pairs.items():
+            if (key, value) not in self._cache:
+                if self.match == "pair":
+                    hay, needle = self._key_tails(key, item_params), self.SEP + value
+                else:
+                    full = full if full is not None else pa.array(item_params)
+                    hay, needle = full, value
+                self._cache[(key, value)] = pc.match_substring(hay, needle).to_numpy(zero_copy_only=False)
+            F[pid] = self._cache[(key, value)]
+        return W, F, [f"{k} {v}" for k, v in pairs]

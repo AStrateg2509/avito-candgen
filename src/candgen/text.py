@@ -1,16 +1,18 @@
-"""Нормализация текстов и разбор фильтров поиска.
+"""Нормализация текстов, разбор фильтров поиска, тексты документов, леммы.
 
-Этап 1 использует отсюда две вещи:
-  * `normalize_query` / `normalize_series` — единое понятие «тот же текст
-    запроса» для срезов seen/unseen (иначе «Ремонт холодильников» и
-    «ремонт холодильников » считались бы разными запросами и давали утечку);
-  * `parse_filters` — разбор `search_infm_params_text` на пары (ключ, значение).
-На этапе 2 сюда добавится сборка текстов документов и лемматизация.
+Что здесь есть:
+  * `normalize_query` / `normalize_series` — единое понятие «тот же текст»
+    (срезы seen/unseen) и единая нормализация запросов и документов;
+  * `parse_filters` — разбор `search_infm_params_text` на пары (ключ, значение);
+  * `build_doc_texts` — текст объявления для лексического поиска
+    (заголовок ×2 + параметры + описание, с обрезкой и опциональной очисткой);
+  * `Lemmatizer` — лемматизация pymorphy3 с кэшем по уникальным словам.
 """
 
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 import pandas as pd
 
@@ -91,3 +93,99 @@ def parse_filters(text: str, pattern: re.Pattern) -> list[tuple[str, str]]:
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
         pairs.append((m.group(1), text[m.end():end].strip()))
     return pairs
+
+
+# --------------------------------------------------------------------------
+# Тексты документов
+# --------------------------------------------------------------------------
+
+def build_doc_texts(items: pd.DataFrame, docs_cfg: dict) -> list[str]:
+    """Собирает нормализованный текст каждого объявления для лексического поиска.
+
+    Порядок действий для каждого поля из docs_cfg["fields"]:
+    очистка шума (только параметры и только при clean_params) → обрезка до
+    max_chars → повтор repeat раз. Поля склеиваются через пробел, результат
+    проходит normalize_query. Обрезка идёт после очистки: служебный шум
+    («График работы от 25200…») не должен съедать лимит символов.
+
+    Вход: DataFrame корпуса с нужными колонками; секция конфига `docs`.
+    Выход: список строк в порядке строк items.
+    """
+    noise = ([re.compile(p) for p in docs_cfg["params_noise"]]
+             if docs_cfg.get("clean_params") else [])
+    parts = []
+    for field in docs_cfg["fields"]:
+        col = items[field["col"]].fillna("").astype(str)
+        if noise and field["col"] == "item_infm_params_text":
+            col = col.map(lambda s: _remove_noise(s, noise))
+        if field.get("max_chars"):
+            col = col.str.slice(0, field["max_chars"])
+        for _ in range(field.get("repeat", 1)):
+            parts.append(col)
+    joined = parts[0]
+    for p in parts[1:]:
+        joined = joined + " " + p
+    return [normalize_query(t) for t in joined]
+
+
+def _remove_noise(text: str, patterns: list[re.Pattern]) -> str:
+    """Вырезает из строки параметров все фрагменты, подходящие под регулярки шума."""
+    for p in patterns:
+        text = p.sub(" ", text)
+    return text
+
+
+# --------------------------------------------------------------------------
+# Лемматизация
+# --------------------------------------------------------------------------
+
+_CYRILLIC_WORD = re.compile(r"^[а-я]+$")
+
+
+class Lemmatizer:
+    """Лемматизация pymorphy3 с кэшем «слово -> лемма».
+
+    Зачем кэш: в корпусе ~0,5 млн уникальных словоформ на ~25 млн словоупотреблений.
+    Разбирать каждое слово один раз в десятки раз быстрее, чем разбирать тексты.
+    Кэш сохраняется в parquet и переиспользуется между запусками.
+    Разбираются только чисто кириллические слова; числа, латиница и смешанные
+    токены остаются как есть. «ё» в лемме заменяется на «е» (как в normalize_query).
+    """
+
+    def __init__(self, cache_path: str | Path | None = None):
+        """Вход: путь к parquet-кэшу (None — без сохранения на диск)."""
+        self.cache_path = Path(cache_path) if cache_path else None
+        self.cache: dict[str, str] = {}
+        if self.cache_path and self.cache_path.exists():
+            df = pd.read_parquet(self.cache_path)
+            self.cache = dict(zip(df["word"], df["lemma"]))
+        self._morph = None
+
+    def _lemma(self, word: str) -> str:
+        """Лемма одного слова (без кэша)."""
+        if not _CYRILLIC_WORD.match(word):
+            return word
+        if self._morph is None:
+            import pymorphy3  # импорт здесь: грузит словари ~1 с, нужен не всегда
+            self._morph = pymorphy3.MorphAnalyzer()
+        return self._morph.parse(word)[0].normal_form.replace("ё", "е")
+
+    def lemmatize_texts(self, texts: list[str]) -> list[str]:
+        """Лемматизирует нормализованные тексты (слова через пробел).
+
+        Вход: список строк после normalize_query.
+        Выход: список строк той же длины, каждое слово заменено леммой.
+        Новые слова добавляются в кэш; кэш сохраняется, если что-то добавилось.
+        """
+        vocab = set()
+        for t in texts:
+            vocab.update(t.split())
+        new_words = [w for w in vocab if w not in self.cache]
+        for w in new_words:
+            self.cache[w] = self._lemma(w)
+        if new_words and self.cache_path:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame({"word": list(self.cache), "lemma": list(self.cache.values())}).to_parquet(
+                self.cache_path, index=False)
+        c = self.cache
+        return [" ".join(c[w] for w in t.split()) for t in texts]
