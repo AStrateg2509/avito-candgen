@@ -224,6 +224,41 @@ fusion:
   # получают штраф −1e4 (фактически исключаются). null — вариант (a), весь корпус.
   loc_mask_min_p: null
 
+# Правки конфига, которые применяются при построении ответа на бенчмарк
+# (submit.py, prerank.py --mode bench): на валидации используется e5-small,
+# дообученный на остатке train, для сабмита — на всём train.
+submit:
+  bench_overrides:
+    - dense.models.e5_small_ft.hf_id=models/finetuned/e5_small_ft_full
+
+# ---------------------------------------------------------------- этап 5 ---
+# LightGBM-предранкер (python -m candgen.prerank). Пул кандидатов — объединение
+# top-pool_depth каналов (каждый канал — набор весов LinearScorer, приоры
+# входят во все). Обучение — cross-fitting на val-запросах (2 фолда по запросам).
+prerank:
+  pool_depth: 100
+  batch_size: 256
+  channels:               # "final" — текущие fusion.weights
+    final: final
+    char: {char: 1.0, loc: 0.067, mc: 0.012, filter: 0.31}
+    word: {word: 1.0, loc: 0.067, mc: 0.012, filter: 0.31}
+    dense: {e5_small_ft: 1.0, loc: 0.067, mc: 0.012, filter: 0.31}
+    expansion: {expansion: 1.0, loc: 0.067, mc: 0.012, filter: 0.31}
+  valid_share: 0.2        # доля обучающих запросов фолда под early stopping
+  lgbm:
+    objective: lambdarank
+    n_estimators: 1000
+    learning_rate: 0.05
+    num_leaves: 31
+    min_child_samples: 50
+    subsample: 0.8
+    subsample_freq: 1
+    colsample_bytree: 0.8
+    reg_lambda: 1.0
+    verbose: -1
+  early_stopping_rounds: 50
+  eval_at: 50
+
 # Подбор весов (python -m candgen.tune): [низ, верх, шкала]; char = 1 — масштаб.
 # Этап 3: добавлены dense (e5_base, user_base) и doc expansion; память не
 # подбирается (вклад ≈ 0, см. EXPERIMENTS.md).

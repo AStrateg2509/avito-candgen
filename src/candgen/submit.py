@@ -98,6 +98,7 @@ def make_answer(cfg: dict) -> str:
     Вход: конфиг. Выход: путь к записанному и проверенному файлу.
     """
     t0 = time.time()
+    cfg = apply_overrides(cfg, cfg["submit"]["bench_overrides"])  # модели, обученные на всём train
     pipe = Pipeline(cfg)
     queries, train = load_query_set(cfg, "bench")
     comp = pipe.prepare(queries, train)

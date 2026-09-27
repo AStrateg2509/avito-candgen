@@ -235,7 +235,7 @@ class FilterPrior:
         (pc.match_substring), результаты кэшируются по паре (ключ, значение).
 
         Вход: тексты фильтров запросов; параметры объявлений корпуса (список строк).
-        Выход: (W float32 [n_q × n_pairs], F bool [n_pairs × N], список пар «ключ значение»).
+        Выход: (W float32 [n_q × n_pairs], F bool [n_pairs × N], список пар (ключ, значение)).
         """
         pairs: dict[tuple[str, str], int] = {}
         entries = []  # (строка запроса, номер пары, вес)
@@ -258,4 +258,4 @@ class FilterPrior:
                     hay, needle = full, value
                 self._cache[(key, value)] = pc.match_substring(hay, needle).to_numpy(zero_copy_only=False)
             F[pid] = self._cache[(key, value)]
-        return W, F, [f"{k} {v}" for k, v in pairs]
+        return W, F, list(pairs)

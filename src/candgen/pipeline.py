@@ -164,10 +164,10 @@ class Pipeline:
         t["mc"] = time.time() - t0
 
         t0 = time.time()
-        W, F, needles = self.filter_prior.build(
+        W, F, pairs = self.filter_prior.build(
             queries["search_infm_params_text"].fillna("").astype(str).tolist(), self.item_params)
         t["filter"] = time.time() - t0
-        t["filter_pairs"] = len(needles)
+        t["filter_pairs"] = len(pairs)
 
         # История train: память по тексту запроса и doc expansion (строятся по
         # переданной части train, поэтому не кэшируются на диск).
@@ -207,7 +207,8 @@ class Pipeline:
             t[f"dense_{name}"] = time.time() - t0
 
         return Components(queries["query_id"].tolist(), self.item_ids, text, P, q_loc_idx,
-                          item_loc_idx, mc_P, item_mc_idx, W, F, t, dense, sparse, loc_geo, q_is_agg)
+                          item_loc_idx, mc_P, item_mc_idx, W, F, t, dense, sparse, loc_geo, q_is_agg,
+                          [k for k, _ in pairs])
 
     def scorer(self, comp: Components) -> LinearScorer:
         """LinearScorer с параметрами приоров из конфига."""

@@ -59,6 +59,7 @@ class Components:
     sparse: dict[str, sp.csr_matrix] = field(default_factory=dict)
     loc_geo: dict = field(default_factory=dict)
     q_is_agg: np.ndarray | None = None
+    filt_keys: list[str] = field(default_factory=list)  # ключ фильтра каждого столбца filt_W
 
 
 # Ключи, которые задают не веса слагаемых, а параметры приоров (LinearScorer.set_params).
