@@ -528,6 +528,7 @@ def evaluate(candidates: dict[str, list[str]], val: ValSet | None = None,
         "share_short": float((lens < k).mean()),
         "n_missing": n_missing,
         "warnings": warnings,
+        "per_query": recall,  # recall каждого запроса в порядке val.queries (для доп. срезов)
     }
 
 

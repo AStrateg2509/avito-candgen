@@ -26,15 +26,15 @@ import yaml
 from candgen import io
 from candgen.fusion import Components, LinearScorer, quota_fuse, rrf_fuse
 from candgen.priors import FilterPrior, LocationPrior, MicrocatPrior
-from candgen.retrievers.dense import DenseModel, item_embeddings
+from candgen.retrievers.dense import DenseModel, item_embeddings, train_item_embeddings
 from candgen.retrievers.lexical import HashedTfidf, build_or_load_corpus_index, restrict_to_queries
-from candgen.retrievers.memory import expansion_texts, memory_matrix
+from candgen.retrievers.memory import expansion_texts, graph_expansion_texts, memory_matrix
 from candgen.text import Lemmatizer, build_doc_texts, normalize_series
 from candgen.torch_utils import get_device
 from candgen.validation import evaluate, format_report, load_train_rest_mask, load_val
 
 ITEM_COLS = ["item_id", "item_location_id", "item_microcat_id", "item_title_raw",
-             "item_infm_params_text", "item_description_raw"]
+             "item_infm_params_text", "item_description_raw", "item_latitude", "item_longitude"]
 TRAIN_COLS = ["search_query", "search_location_id", "item_id", "item_location_id", "item_microcat_id"]
 
 
@@ -106,6 +106,17 @@ class Pipeline:
             self._docs[(fkey, True)] = self.lemmatizer.lemmatize_texts(self._docs[(fkey, False)])
         return self._docs[(fkey, src_cfg["lemmatize"])]
 
+    def train_item_table(self) -> pd.DataFrame:
+        """Уникальные объявления ВСЕГО train (id, подкатегория, поля dense-документа), по id.
+
+        Эмбеддинги считаются по всем объявлениям train один раз и кэшируются.
+        Какие из них реально доступны (остаток на валидации), решает
+        graph_expansion_texts по переданной части train.
+        """
+        cols = ["item_id", "item_microcat_id"] + [f["col"] for f in self.cfg["dense"]["doc_fields"]]
+        tr = io.load_train(self.cfg, list(dict.fromkeys(cols)))
+        return tr.drop_duplicates("item_id").sort_values("item_id").reset_index(drop=True)
+
     def index(self, name: str) -> tuple:
         """(источник, матрица корпуса CSC) из кэша artifacts/lex или построенные заново.
 
@@ -134,12 +145,17 @@ class Pipeline:
         self._docs.clear()  # тексты документов тоже (нужны только при построении индексов)
 
         t0 = time.time()
-        P, uq, ui, n_fallback = LocationPrior(cfg["priors"]["loc"]).fit(train).matrix(
-            queries["search_location_id"].to_numpy(), items["item_location_id"].to_numpy())
+        loc_prior = LocationPrior(cfg["priors"]["loc"]).fit(train)
+        P, uq, ui, n_fallback = loc_prior.matrix(queries["search_location_id"].to_numpy(),
+                                                 items["item_location_id"].to_numpy())
         q_loc_idx = np.searchsorted(uq, queries["search_location_id"].to_numpy())
         item_loc_idx = np.searchsorted(ui, items["item_location_id"].to_numpy())
+        # Фишки 2 и 6: гео-данные для сглаживания и тип локации запроса.
+        loc_geo = loc_prior.geo_matrices(uq, ui, items)
+        q_is_agg = loc_geo["self_share"][q_loc_idx] < cfg["priors"]["loc"]["agg_self_share_max"]
         t["loc"] = time.time() - t0
         t["loc_fallback_locations"] = n_fallback
+        t["agg_queries"] = int(q_is_agg.sum())
 
         t0 = time.time()
         mc_index = np.unique(items["item_microcat_id"].to_numpy())
@@ -167,23 +183,42 @@ class Pipeline:
         t["memory+expansion"] = time.time() - t0
         t["memory_queries"] = int((sparse["memory"].getnnz(axis=1) > 0).sum())
 
-        dense = {}
-        for name in cfg["dense"]["active"]:
+        # Dense-модели: активные источники + модель для фишки 4 (поиск соседей).
+        dense, dcfg, gcfg = {}, cfg["dense"], cfg["graph_expansion"]
+        needed = list(dict.fromkeys(dcfg["active"] + ([gcfg["model"]] if gcfg["enabled"] else [])))
+        for name in needed:
             t0 = time.time()
-            dcfg = cfg["dense"]
             model = DenseModel(name, dcfg["models"][name], self.device, dcfg["fp16"], dcfg["batch_size"])
             E = item_embeddings(cfg, name, model, items)
-            dense[name] = (E, model.encode_queries(queries["search_query"].fillna("").astype(str).tolist()))
+            if name in dcfg["active"]:
+                dense[name] = (E, model.encode_queries(queries["search_query"].fillna("").astype(str).tolist()))
+            if gcfg["enabled"] and name == gcfg["model"]:
+                titems = self.train_item_table()
+                E_tr = train_item_embeddings(cfg, name, model, titems)
+                g_texts, g_stats = graph_expansion_texts(
+                    E, items["item_microcat_id"].to_numpy(), items["item_id"].to_numpy(),
+                    titems, E_tr, train, gcfg, self.device)
+                g_model = HashedTfidf("gexp", gcfg["source"], cfg["lexical"]["sublinear_tf"])
+                X_g = g_model.fit_transform(g_texts, cfg["n_jobs"], cfg["lexical"]["chunk_size"]).tocsc()
+                text["gexp"] = restrict_to_queries(X_g, g_model.transform(qn))
+                del X_g, g_texts
+                t.update({f"gexp_{k}": v for k, v in g_stats.items()})
             model.close()
             t[f"dense_{name}"] = time.time() - t0
 
         return Components(queries["query_id"].tolist(), self.item_ids, text, P, q_loc_idx,
-                          item_loc_idx, mc_P, item_mc_idx, W, F, t, dense, sparse)
+                          item_loc_idx, mc_P, item_mc_idx, W, F, t, dense, sparse, loc_geo, q_is_agg)
 
     def scorer(self, comp: Components) -> LinearScorer:
-        """LinearScorer с eps из конфига."""
-        pc_ = self.cfg["priors"]
-        return LinearScorer(comp, self.device, pc_["loc"]["eps"], pc_["mc"]["eps"])
+        """LinearScorer с параметрами приоров из конфига."""
+        return LinearScorer(comp, self.device, **default_params(self.cfg))
+
+
+def default_params(cfg: dict) -> dict:
+    """Параметры приоров из конфига в формате LinearScorer.set_params."""
+    loc, mc = cfg["priors"]["loc"], cfg["priors"]["mc"]
+    return {"loc_eps": loc["eps"], "mc_eps": mc["eps"],
+            "loc_sigma": loc["sigma_km"], "loc_lambda": loc["smooth_lambda"]}
 
 
 def summary_line(name: str, res: dict) -> str:
@@ -227,8 +262,13 @@ def main() -> None:
     print(f"\nВариант срезов: {args.variant}; набор: {args.ablation or 'config'}; "
           f"правки: {args.set or 'нет'}\n\n{SUMMARY_HEADER}")
     res = None
+    agg_by_qid = dict(zip(comp.query_ids, comp.q_is_agg))
+    is_agg = np.array([agg_by_qid[q] for q in val.queries["query_id"]])
+    print(f"Запросов из регионов-агрегатов: {is_agg.sum()} из {len(is_agg)}")
     for run in runs:
         t1 = time.time()
+        # параметры приоров: из конфига, поверх — правки конкретного запуска
+        scorer.set_params(**{**default_params(cfg), **run.get("params", {})})
         method = run.get("method", "linear")
         if method == "linear":
             cands = scorer.candidates(run["weights"], fcfg["k"], fcfg["batch_size"],
@@ -241,7 +281,10 @@ def main() -> None:
         else:
             raise ValueError(f"неизвестный метод слияния {method}")
         res = evaluate(cands, val)
-        print(summary_line(run["name"], res) + f"  ({time.time() - t1:.1f} с)")
+        pq_ = res["per_query"]
+        print(summary_line(run["name"], res)
+              + f" город {pq_[~is_agg].mean():.4f} / агрегат {pq_[is_agg].mean():.4f}"
+              + f"  ({time.time() - t1:.1f} с)")
     print("\n" + format_report(res))
     # Пиковая память основного процесса (ru_maxrss в Linux — в КБ).
     print(f"\nПик RSS процесса: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2:.1f} ГБ")

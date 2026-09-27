@@ -26,12 +26,29 @@ from candgen.text import compile_filter_keys, parse_filters
 from candgen.torch_utils import dense_batch_T, to_torch_csr
 
 
+def haversine_km(lat1: np.ndarray, lon1: np.ndarray, lat2: np.ndarray, lon2: np.ndarray) -> np.ndarray:
+    """Расстояние по дуге большого круга в км (векторно, с broadcasting)."""
+    lat1, lon1, lat2, lon2 = map(np.radians, (lat1, lon1, lat2, lon2))
+    a = (np.sin((lat2 - lat1) / 2) ** 2
+         + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2) ** 2)
+    return 2 * 6371.0 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+
+
 class LocationPrior:
-    """P(item_loc | search_loc) по частоте кликов в train.
+    """P(item_loc | search_loc) по частоте кликов в train (+ данные для фишек 2 и 6).
 
     Для локации поиска, которой нет в train, берётся запасной вариант из
     конфига: 'self' — вся масса на ту же локацию (если в корпусе она есть),
     'uniform' — равномерно по локациям корпуса.
+
+    Фишка 2 (иерархия локаций из данных): каждой локации приписываются
+    координаты — медиана координат объявлений в ней, а для локации поиска без
+    своих объявлений (регион) — центр её кликов. Скорер может сгладить
+    P(i|s) = (C[s,i] + λ·K[s,i]) / (N_s + λ), K[s,i] ∝ n_items(i)·exp(−dist(s,i)/σ):
+    соседние населённые пункты получают ненулевую вероятность, даже если из
+    города туда ещё не кликали.
+    Фишка 6 (город или агрегат): доля кликов локации поиска в саму себя.
+    У городов она > 0.6, у регионов-агрегатов ≈ 0 (в данных распределение бимодально).
     """
 
     def __init__(self, loc_cfg: dict):
@@ -43,6 +60,42 @@ class LocationPrior:
         """Считает число кликов для каждой пары (search_location_id, item_location_id)."""
         self.counts = train.groupby(["search_location_id", "item_location_id"]).size()
         return self
+
+    def geo_matrices(self, uq: np.ndarray, ui: np.ndarray, items: pd.DataFrame) -> dict:
+        """Данные для сглаживания и маршрутизации по типу локации.
+
+        Вход: уникальные локации запросов (uq) и корпуса (ui) — в том же порядке,
+              что у matrix(); корпус с item_location_id, item_latitude, item_longitude.
+        Выход: {C: клики [n_uq × n_ui], N: всего кликов строки [n_uq],
+                D: расстояния в км [n_uq × n_ui] (NaN, если координат нет),
+                w: число объявлений корпуса в локации [n_ui], self_share: [n_uq]}.
+        """
+        cen = items.groupby("item_location_id")[["item_latitude", "item_longitude"]].median()
+        w = items["item_location_id"].value_counts().reindex(ui).fillna(0).to_numpy(np.float32)
+        df = self.counts.rename("n").reset_index()
+        N = df.groupby("search_location_id")["n"].sum().reindex(uq).fillna(0).to_numpy(np.float32)
+        qpos = pd.Series(np.arange(len(uq)), index=uq)
+        ipos = pd.Series(np.arange(len(ui)), index=ui)
+        C = np.zeros((len(uq), len(ui)), dtype=np.float32)
+        sub = df[df["search_location_id"].isin(qpos.index) & df["item_location_id"].isin(ipos.index)]
+        C[qpos.loc[sub["search_location_id"]].to_numpy(), ipos.loc[sub["item_location_id"]].to_numpy()] = sub["n"]
+
+        # Координаты локации поиска: своя, если в ней есть объявления корпуса;
+        # иначе — центр её кликов, взвешенный числом кликов (для регионов).
+        # copy=True: в pandas 3 (Copy-on-Write) to_numpy() отдаёт массив только для чтения
+        qlat = cen["item_latitude"].reindex(uq).to_numpy(dtype=float, copy=True)
+        qlon = cen["item_longitude"].reindex(uq).to_numpy(dtype=float, copy=True)
+        ilat = cen["item_latitude"].reindex(ui).to_numpy()
+        ilon = cen["item_longitude"].reindex(ui).to_numpy()
+        clicks = C.sum(axis=1)
+        no_own = np.isnan(qlat) & (clicks > 0)
+        qlat[no_own] = (C[no_own] @ np.nan_to_num(ilat)) / clicks[no_own]
+        qlon[no_own] = (C[no_own] @ np.nan_to_num(ilon)) / clicks[no_own]
+        D = haversine_km(qlat[:, None], qlon[:, None], ilat[None, :], ilon[None, :]).astype(np.float32)
+
+        self_share = np.array([C[qpos[s], ipos[s]] / N[qpos[s]] if s in ipos.index and N[qpos[s]] > 0 else 0.0
+                               for s in uq], dtype=np.float32)
+        return {"C": C, "N": N, "D": D, "w": w, "self_share": self_share}
 
     def matrix(self, query_locs: np.ndarray, item_locs: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
         """Плотная матрица P для локаций запросов (строки) и локаций корпуса (столбцы).

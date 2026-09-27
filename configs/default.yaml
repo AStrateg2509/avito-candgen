@@ -113,8 +113,9 @@ lexical:
 # (HF_HUB_OFFLINE=1). Вес модели в fusion.weights — по её имени (e5_base, ...).
 dense:
   # Какие модели участвуют в скоринге (имена из models). e5_base проверен на
-  # этапе 3: поверх USER-base даёт 0.12 п.п. (< 0.3) — выключен.
-  active: [user_base]
+  # этапе 3: поверх USER-base даёт 0.12 п.п. (< 0.3) — выключен. Этап 4:
+  # дообученная e5-small (фишка 7) вместо USER-base: +0.82 п.п.
+  active: [e5_small_ft]
   batch_size: 256
   fp16: true
   # Текст документа для dense: сырые поля через «. » (без нормализации —
@@ -138,6 +139,25 @@ dense:
       query_prefix: 'query: '
       doc_prefix: 'passage: '
       max_len: 128
+    # Фишка 7: e5-small, дообученный на train (python -m candgen.finetune).
+    # На валидации — модель, обученная на остатке (_val); для сабмита путь
+    # переопределяется на _full (см. scripts/run_all.sh).
+    e5_small_ft:
+      hf_id: models/finetuned/e5_small_ft_val
+      query_prefix: 'query: '
+      doc_prefix: 'passage: '
+      max_len: 128
+
+# Фишка 7: параметры дообучения (1 эпоха MNRL с hard negatives по локации).
+finetune:
+  base_model: e5_small
+  batch_size: 128
+  lr: 3.0e-5
+  warmup_share: 0.05
+  scale: 20.0             # множитель косинусов в softmax (температура 0.05)
+  query_max_len: 32       # запросы короткие (~3 слова); документ — max_len модели
+  max_pairs: null         # null — все уникальные пары (запрос, объявление)
+  out_dir: models/finetuned
 
 # История train (src/candgen/retrievers/memory.py). Веса — memory и expansion
 # в fusion.weights.
@@ -151,10 +171,34 @@ memory:
     n_features: 4194304
     lemmatize: false
 
+# Фишка 4 (этап 4): перенос запросов train на похожие объявления корпуса.
+# Соседи — объявления train той же подкатегории по dense-эмбеддингу модели
+# model с косинусом ≥ min_sim; вес источника — gexp в fusion.weights.
+# Проверено: и мягкий (k=5, 0.85), и строгий (k=3, 0.92) варианты не дают
+# прироста (−0.07…−1.2 п.п.) — выключено, код оставлен (EXPERIMENTS.md).
+graph_expansion:
+  enabled: false
+  model: user_base
+  k: 5
+  min_sim: 0.85
+  same_microcat: true
+  queries_per_neighbor: 10
+  source:
+    analyzer: char_wb
+    ngram_range: [3, 5]
+    n_features: 4194304
+    lemmatize: false
+
 priors:
   loc:
     eps: 3.0e-6           # score += α·log(P(item_loc | search_loc) + eps); подобрано (ТЗ: 1e-4)
     fallback: self        # локации поиска нет в train: self — P=1 своей, uniform — равномерно
+    # Фишка 2: гео-сглаживание P = (C + λ·K)/(N + λ), K ∝ n_items·exp(−км/σ); λ = 0 — выкл.
+    smooth_lambda: 0.0
+    sigma_km: 30.0
+    # Фишка 6: локация поиска — «агрегат» (регион), если доля кликов в неё саму
+    # меньше порога (у городов > 0.6, у регионов ≈ 0 — распределение бимодально).
+    agg_self_share_max: 0.5
   mc:
     k: 20                 # соседей среди текстов train (char 2–4 TF-IDF)
     ngram_range: [2, 4]
@@ -173,8 +217,9 @@ fusion:
   # Этап 2: {char 1, word 0.52, loc 0.052, mc 0.013, filter 0.74}, eps 3e-5 / 1.3e-3.
   # Baseline ТЗ: {char 1, loc 0.05, mc 0.03, filter 0.2}, eps 1e-4 / 1e-3.
   # e5_base выключен: без него −0.12 п.п. (< 0.3) — одна dense-модель проще.
-  weights: {char: 1.0, word: 0.61, title: 0.0, e5_base: 0.0, user_base: 0.22, expansion: 0.39,
-            memory: 0.0, loc: 0.067, mc: 0.012, filter: 0.31}
+  # Этап 4: user_base заменён дообученной e5_small_ft (стартовые веса до переподбора).
+  weights: {char: 1.0, word: 0.61, title: 0.0, e5_base: 0.0, user_base: 0.0, e5_small_ft: 0.5,
+            expansion: 0.39, memory: 0.0, loc: 0.067, mc: 0.012, filter: 0.31}
   # Вариант (b): объявления с P_loc(item_loc | search_loc) ниже порога
   # получают штраф −1e4 (фактически исключаются). null — вариант (a), весь корпус.
   loc_mask_min_p: null
@@ -186,13 +231,26 @@ tune:
   n_trials: 60
   space:
     word: [0.0, 1.0, uniform]
-    user_base: [0.0, 1.5, uniform]
+    e5_small_ft: [0.0, 1.5, uniform]
     expansion: [0.0, 0.8, uniform]
     loc: [0.01, 0.3, log]
     mc: [0.005, 0.2, log]
     filter: [0.02, 1.0, log]
-    loc_eps: [1.0e-6, 1.0e-2, log]
+    loc_eps: [1.0e-8, 1.0e-2, log]   # этап 3 упёрся в 1e-6 — нижняя граница расширена
     mc_eps: [1.0e-5, 1.0e-1, log]
+  # Именованные пространства (python -m candgen.tune --space <имя>).
+  spaces:
+    # Фишки 2 + 6: гео-сглаживание и отдельные веса для регионов-агрегатов
+    # (веса для городов — из fusion.weights, не меняются).
+    feat26:
+      loc_lambda: [0.0, 20.0, uniform]
+      loc_sigma: [5.0, 200.0, log]
+      loc_agg: [0.01, 0.2, log]
+      mc_agg: [0.003, 0.1, log]
+      filter_agg: [0.02, 1.0, log]
+      word_agg: [0.0, 1.5, uniform]
+      user_base_agg: [0.0, 1.5, uniform]
+      expansion_agg: [0.0, 0.8, uniform]
 
 # Именованные наборы запусков: python -m candgen.pipeline --ablation <имя>.
 # У запуска: name, weights и (необязательно) loc_mask_min_p — вариант (b).
@@ -276,6 +334,43 @@ experiments:
       channels:
         linear: {n: 40, weights: *stage3}
         dense: {n: 10, weights: {e5_base: 1.28, user_base: 0.44, loc: 0.067, mc: 0.012, filter: 0.31}}
+  # Этап 4, фишки 2 (гео-сглаживание P_loc) и 6 (свой вес для регионов-агрегатов).
+  feat26:
+    - {name: итог этапа 3, weights: &s3fin {char: 1.0, word: 0.61, user_base: 0.22, expansion: 0.39, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: "ф2: λ=1 σ=10", weights: *s3fin, params: {loc_lambda: 1.0, loc_sigma: 10.0}}
+    - {name: "ф2: λ=1 σ=30", weights: *s3fin, params: {loc_lambda: 1.0, loc_sigma: 30.0}}
+    - {name: "ф2: λ=1 σ=100", weights: *s3fin, params: {loc_lambda: 1.0, loc_sigma: 100.0}}
+    - {name: "ф2: λ=5 σ=10", weights: *s3fin, params: {loc_lambda: 5.0, loc_sigma: 10.0}}
+    - {name: "ф2: λ=5 σ=30", weights: *s3fin, params: {loc_lambda: 5.0, loc_sigma: 30.0}}
+    - {name: "ф2: λ=5 σ=100", weights: *s3fin, params: {loc_lambda: 5.0, loc_sigma: 100.0}}
+    - {name: "ф2: λ=20 σ=10", weights: *s3fin, params: {loc_lambda: 20.0, loc_sigma: 10.0}}
+    - {name: "ф2: λ=20 σ=30", weights: *s3fin, params: {loc_lambda: 20.0, loc_sigma: 30.0}}
+    - {name: "ф2: λ=20 σ=100", weights: *s3fin, params: {loc_lambda: 20.0, loc_sigma: 100.0}}
+    - {name: "ф6: loc_agg=0.02", weights: {char: 1.0, word: 0.61, user_base: 0.22, expansion: 0.39, loc: 0.067, loc_agg: 0.02, mc: 0.012, filter: 0.31}}
+    - {name: "ф6: loc_agg=0.04", weights: {char: 1.0, word: 0.61, user_base: 0.22, expansion: 0.39, loc: 0.067, loc_agg: 0.04, mc: 0.012, filter: 0.31}}
+    - {name: "ф6: loc_agg=0.1", weights: {char: 1.0, word: 0.61, user_base: 0.22, expansion: 0.39, loc: 0.067, loc_agg: 0.1, mc: 0.012, filter: 0.31}}
+    - {name: "ф6: loc_agg=0.15", weights: {char: 1.0, word: 0.61, user_base: 0.22, expansion: 0.39, loc: 0.067, loc_agg: 0.15, mc: 0.012, filter: 0.31}}
+  # Этап 4, фишка 4: перенос запросов на похожие объявления (источник gexp).
+  feat4:
+    - {name: итог этапа 3, weights: *s3fin}
+    - {name: "ф4: + gexp 0.1", weights: {char: 1.0, word: 0.61, user_base: 0.22, expansion: 0.39, gexp: 0.1, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: "ф4: + gexp 0.2", weights: {char: 1.0, word: 0.61, user_base: 0.22, expansion: 0.39, gexp: 0.2, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: "ф4: + gexp 0.4", weights: {char: 1.0, word: 0.61, user_base: 0.22, expansion: 0.39, gexp: 0.4, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: "ф4: gexp 0.2 вместо expansion", weights: {char: 1.0, word: 0.61, user_base: 0.22, gexp: 0.2, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: "ф4: gexp 0.4 вместо expansion", weights: {char: 1.0, word: 0.61, user_base: 0.22, gexp: 0.4, loc: 0.067, mc: 0.012, filter: 0.31}}
+  feat4b:
+    - {name: итог этапа 3, weights: *s3fin}
+    - {name: "ф4 строгий: + gexp 0.1", weights: {char: 1.0, word: 0.61, user_base: 0.22, expansion: 0.39, gexp: 0.1, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: "ф4 строгий: + gexp 0.2", weights: {char: 1.0, word: 0.61, user_base: 0.22, expansion: 0.39, gexp: 0.2, loc: 0.067, mc: 0.012, filter: 0.31}}
+  # Фишка 7 (нужен dense.active: [user_base, e5_small_ft] и graph_expansion.enabled: false).
+  feat7:
+    - {name: итог этапа 3, weights: *s3fin}
+    - {name: "ф7: + e5_small_ft 0.2", weights: {char: 1.0, word: 0.61, user_base: 0.22, e5_small_ft: 0.2, expansion: 0.39, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: "ф7: + e5_small_ft 0.5", weights: {char: 1.0, word: 0.61, user_base: 0.22, e5_small_ft: 0.5, expansion: 0.39, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: "ф7: + e5_small_ft 1.0", weights: {char: 1.0, word: 0.61, user_base: 0.22, e5_small_ft: 1.0, expansion: 0.39, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: "ф7: e5_small_ft 0.5 вместо user_base", weights: {char: 1.0, word: 0.61, e5_small_ft: 0.5, expansion: 0.39, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: "ф7: e5_small_ft без приоров", weights: {e5_small_ft: 1.0}}
+    - {name: "user_base без приоров (для сравнения)", weights: {user_base: 1.0}}
   mask:
     - {name: (a) весь корпус, weights: *baseline}
     - {name: (b) P_loc ≥ 0.001, weights: *baseline, loc_mask_min_p: 0.001}

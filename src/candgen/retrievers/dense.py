@@ -80,6 +80,46 @@ class DenseModel:
             torch.cuda.empty_cache()
 
 
+def _local_model_stamp(mcfg: dict) -> str:
+    """Для локальной (дообученной) модели — время изменения её весов, иначе "".
+
+    Входит в ключ кэша эмбеддингов: переобучили модель по тому же пути —
+    эмбеддинги корпуса пересчитаются, а не возьмутся устаревшие.
+    """
+    path = Path(mcfg["hf_id"])
+    if not path.is_dir():
+        return ""
+    weights = sorted(path.glob("*.safetensors")) or sorted(path.glob("*.bin"))
+    return str(max(w.stat().st_mtime_ns for w in weights)) if weights else ""
+
+
+def train_item_embeddings(cfg: dict, name: str, model: DenseModel, train_items: pd.DataFrame) -> np.ndarray:
+    """Эмбеддинги уникальных объявлений train (для фишки 4), с кэшем на диске.
+
+    Текст документа — тот же, что у корпуса (dense.doc_fields), поэтому
+    объявления train и корпуса лежат в одном пространстве. Ключ кэша зависит
+    и от списка объявлений (train фиксирован, но так надёжнее).
+
+    Вход: конфиг, имя модели, загруженная модель, таблица уникальных
+          объявлений train (item_id + поля документа) в фиксированном порядке.
+    Выход: float16 [n_train_items × d] в порядке строк train_items.
+    """
+    dcfg = cfg["dense"]
+    ids_hash = hashlib.sha1("".join(train_items["item_id"]).encode()).hexdigest()[:8]
+    payload = json.dumps([dcfg["models"][name], dcfg["doc_fields"], ids_hash], sort_keys=True,
+                         ensure_ascii=False)
+    key = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
+    path = Path(cfg["paths"]["artifacts_dir"]) / "dense" / f"emb_train_items_{name}_{key}.npy"
+    if path.exists():
+        return np.load(path)
+    t0 = time.time()
+    emb = model.encode_docs(build_raw_doc_texts(train_items, dcfg["doc_fields"]))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(path, emb)
+    print(f"[dense] {name}: объявления train ({len(train_items)}) закодированы за {time.time() - t0:.0f} с -> {path}")
+    return emb
+
+
 def item_embeddings(cfg: dict, name: str, model: DenseModel, items: pd.DataFrame) -> np.ndarray:
     """Эмбеддинги корпуса для модели: из кэша или кодированием (с печатью скорости).
 
@@ -90,7 +130,10 @@ def item_embeddings(cfg: dict, name: str, model: DenseModel, items: pd.DataFrame
     Выход: float16 [N × d] в порядке строк items.
     """
     dcfg = cfg["dense"]
-    payload = json.dumps([dcfg["models"][name], dcfg["doc_fields"]], sort_keys=True, ensure_ascii=False)
+    stamp = _local_model_stamp(dcfg["models"][name])
+    # метка добавляется только локальным моделям: ключи кэша моделей с HF не меняются
+    payload = json.dumps([dcfg["models"][name], dcfg["doc_fields"]] + ([stamp] if stamp else []),
+                         sort_keys=True, ensure_ascii=False)
     key = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
     path = Path(cfg["paths"]["artifacts_dir"]) / "dense" / f"emb_items_{name}_{key}.npy"
     if path.exists():

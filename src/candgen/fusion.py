@@ -40,7 +40,9 @@ class Components:
     filt_W, filt_F — бонус фильтра = filt_W @ filt_F  ([n_q × n_p] @ [n_p × N]);
     timings  — время подготовки частей (для отчёта);
     dense    — {модель: (эмбеддинги корпуса [N × d], эмбеддинги запросов [n_q × d])}, fp16;
-    sparse   — {источник: разреженная матрица скоров [n_q × N]} (например, память train).
+    sparse   — {источник: разреженная матрица скоров [n_q × N]} (например, память train);
+    loc_geo  — данные для гео-сглаживания P_loc (LocationPrior.geo_matrices: C, N, D, w);
+    q_is_agg — запрос из локации-агрегата (региона), а не города [n_q] (фишка 6).
     """
     query_ids: list[str]
     item_ids: np.ndarray
@@ -55,6 +57,12 @@ class Components:
     timings: dict = field(default_factory=dict)
     dense: dict[str, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
     sparse: dict[str, sp.csr_matrix] = field(default_factory=dict)
+    loc_geo: dict = field(default_factory=dict)
+    q_is_agg: np.ndarray | None = None
+
+
+# Ключи, которые задают не веса слагаемых, а параметры приоров (LinearScorer.set_params).
+PARAM_KEYS = ("loc_eps", "mc_eps", "loc_sigma", "loc_lambda")
 
 
 class LinearScorer:
@@ -64,13 +72,19 @@ class LinearScorer:
     Optuna) стоит только пересчёта скоров: ~7 с на 6,5 тыс. запросов.
     """
 
-    def __init__(self, comp: Components, device: torch.device, loc_eps: float, mc_eps: float):
-        """Вход: компоненты; устройство; eps для логарифмов приоров."""
+    def __init__(self, comp: Components, device: torch.device, loc_eps: float, mc_eps: float,
+                 loc_sigma: float = 30.0, loc_lambda: float = 0.0):
+        """Вход: компоненты; устройство; eps для логарифмов приоров; параметры
+        гео-сглаживания P_loc (σ в км, λ — псевдосчётчик; λ = 0 — без сглаживания)."""
         self.comp = comp
         self.device = device
         self.n_items = len(comp.item_ids)
         self.text = {name: (to_torch_csr(X, device), Q) for name, (X, Q) in comp.text.items()}
-        self.loc_P = torch.from_numpy(comp.loc_P).to(device)
+        self.loc_P_raw = torch.from_numpy(comp.loc_P).to(device)
+        self.geo = {k: torch.from_numpy(v).to(device) for k, v in comp.loc_geo.items()
+                    if k in ("C", "N", "D", "w")}
+        is_agg = comp.q_is_agg if comp.q_is_agg is not None else np.zeros(len(comp.query_ids), bool)
+        self.q_is_agg = torch.from_numpy(is_agg).to(device)
         self.q_loc = torch.from_numpy(comp.q_loc_idx).long().to(device)
         self.i_loc = torch.from_numpy(comp.item_loc_idx).long().to(device)
         self.mc_P = torch.from_numpy(comp.mc_P).to(device)
@@ -80,16 +94,48 @@ class LinearScorer:
         self.dense = {name: (torch.from_numpy(E).to(device), torch.from_numpy(Q).to(device))
                       for name, (E, Q) in comp.dense.items()}
         self.sparse = comp.sparse  # строки батча уплотняются на лету
-        self.set_eps(loc_eps, mc_eps)
+        self.params = {"loc_eps": loc_eps, "mc_eps": mc_eps, "loc_sigma": loc_sigma, "loc_lambda": loc_lambda}
+        self.set_params()
+
+    def set_params(self, **params) -> None:
+        """Пересчитывает приоры с новыми параметрами (абляция, Optuna) на GPU.
+
+        loc_eps / mc_eps — «пол» для нулевой вероятности в логарифме: чем он
+        меньше, тем сильнее штраф объявлению из локации или подкатегории, куда
+        запрос не кликал. loc_lambda > 0 включает гео-сглаживание (фишка 2):
+        P = (C + λ·K) / (N + λ), K ∝ n_items(i)·exp(−dist/σ), строка K суммируется в 1.
+        У строк без кликов (N = 0) это даёт P = K — «соседи по карте».
+        """
+        self.params.update({k: v for k, v in params.items() if v is not None})
+        p = self.params
+        if p["loc_lambda"] > 0 and self.geo:
+            g = self.geo
+            K = g["w"][None, :] * torch.exp(-g["D"] / p["loc_sigma"])
+            # нет координат у локации поиска -> ядро пропорционально числу объявлений
+            K = torch.where(torch.isnan(K), g["w"][None, :].expand_as(K), K)
+            K = K / K.sum(dim=1, keepdim=True).clamp(min=1e-12)
+            self.loc_P = (g["C"] + p["loc_lambda"] * K) / (g["N"][:, None] + p["loc_lambda"])
+        else:
+            self.loc_P = self.loc_P_raw
+        self.loc_logP = torch.log(self.loc_P + p["loc_eps"])
+        self.mc_logP = torch.log(self.mc_P + p["mc_eps"])
 
     def set_eps(self, loc_eps: float, mc_eps: float) -> None:
-        """Пересчитывает логарифмы приоров с новыми eps (нужно при подборе в Optuna).
+        """Совместимость: то же, что set_params(loc_eps=..., mc_eps=...)."""
+        self.set_params(loc_eps=loc_eps, mc_eps=mc_eps)
 
-        eps задаёт «пол» для нулевой вероятности: чем он меньше, тем сильнее
-        штрафуется объявление из локации или подкатегории, куда запрос не кликал.
+    def _weight(self, weights: dict, name: str, rows: slice) -> torch.Tensor | None:
+        """Вес слагаемого для строк батча: столбец [B × 1] или None, если он нулевой.
+
+        Фишка 6: если задан ключ «<имя>_agg», запросы из регионов-агрегатов
+        получают этот вес, а запросы из городов — обычный «<имя>».
         """
-        self.loc_logP = torch.log(self.loc_P + loc_eps)
-        self.mc_logP = torch.log(self.mc_P + mc_eps)
+        w_city = weights.get(name, 0.0)
+        w_agg = weights.get(f"{name}_agg", w_city)
+        if not (w_city or w_agg):
+            return None
+        return torch.where(self.q_is_agg[rows], torch.tensor(float(w_agg), device=self.device),
+                           torch.tensor(float(w_city), device=self.device))[:, None]
 
     @torch.no_grad()
     def batch_scores(self, rows: slice, weights: dict, loc_mask_min_p: float | None = None) -> torch.Tensor:
@@ -97,27 +143,48 @@ class LinearScorer:
         b = rows.stop - rows.start
         S = torch.zeros((b, self.n_items), device=self.device)
         for name, (X, Q) in self.text.items():
-            w = weights.get(name, 0.0)
-            if w:
-                S.add_(torch.sparse.mm(X, dense_batch_T(Q, rows, self.device)).T, alpha=w)
+            w = self._weight(weights, name, rows)
+            if w is not None:
+                S.add_(torch.sparse.mm(X, dense_batch_T(Q, rows, self.device)).T * w)
         for name, (E, Q) in self.dense.items():
-            w = weights.get(name, 0.0)
-            if w:
-                S.add_((Q[rows] @ E.T).float(), alpha=w)  # косинус: векторы L2-нормированы
+            w = self._weight(weights, name, rows)
+            if w is not None:
+                S.add_((Q[rows] @ E.T).float() * w)  # косинус: векторы L2-нормированы
         for name, M in self.sparse.items():
-            w = weights.get(name, 0.0)
-            if w:
-                S.add_(torch.from_numpy(M[rows].toarray()).to(self.device), alpha=w)
+            w = self._weight(weights, name, rows)
+            if w is not None:
+                S.add_(torch.from_numpy(M[rows].toarray()).to(self.device) * w)
         q_loc = self.q_loc[rows]
-        if weights.get("loc", 0.0):
-            S.add_(self.loc_logP[q_loc][:, self.i_loc], alpha=weights["loc"])
+        w = self._weight(weights, "loc", rows)
+        if w is not None:
+            S.add_(self.loc_logP[q_loc][:, self.i_loc] * w)
         if loc_mask_min_p is not None:
             S.sub_((self.loc_P[q_loc][:, self.i_loc] < loc_mask_min_p).float(), alpha=MASK_PENALTY)
-        if weights.get("mc", 0.0):
-            S.add_(self.mc_logP[rows][:, self.i_mc], alpha=weights["mc"])
-        if weights.get("filter", 0.0):
-            S.add_(self.filt_W[rows] @ self.filt_F, alpha=weights["filter"])
+        w = self._weight(weights, "mc", rows)
+        if w is not None:
+            S.add_(self.mc_logP[rows][:, self.i_mc] * w)
+        w = self._weight(weights, "filter", rows)
+        if w is not None:
+            S.add_((self.filt_W[rows] @ self.filt_F) * w)
         return S
+
+    @torch.no_grad()
+    def explain(self, rows: slice, idx: np.ndarray, weights: dict) -> dict[str, np.ndarray]:
+        """Вклад каждого слагаемого скора для заданных объявлений (для демо-страницы).
+
+        Вход: срез запросов; индексы объявлений [B × m] (например, их top-m);
+              веса слагаемых (как в batch_scores).
+        Выход: {слагаемое: вклад с учётом веса [B × m]}; сумма вкладов = скор.
+        """
+        take = torch.from_numpy(idx).to(self.device)
+        parts = {}
+        for name in list(self.text) + list(self.dense) + list(self.sparse) + ["loc", "mc", "filter"]:
+            w = weights.get(name, 0.0)
+            if not w:
+                continue
+            S = self.batch_scores(rows, {name: w})  # скор только этого слагаемого
+            parts[name] = torch.gather(S, 1, take).cpu().numpy()
+        return parts
 
     @torch.no_grad()
     def topk(self, weights: dict, k: int = 50, batch_size: int = 512,

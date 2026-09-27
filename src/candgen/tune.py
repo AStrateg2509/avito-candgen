@@ -23,8 +23,8 @@ from pathlib import Path
 import optuna
 
 from candgen import io
-from candgen.fusion import LinearScorer
-from candgen.pipeline import Pipeline, apply_overrides, load_query_set
+from candgen.fusion import PARAM_KEYS, LinearScorer
+from candgen.pipeline import Pipeline, apply_overrides, default_params, load_query_set
 from candgen.validation import ValSet, evaluate, load_val, split_halves, subset_val
 
 
@@ -42,8 +42,8 @@ def score_params(scorer: LinearScorer, params: dict, base: dict, fcfg: dict, val
     Выход: результат evaluate.
     """
     p = {**base, **params}
-    scorer.set_eps(p["loc_eps"], p["mc_eps"])
-    weights = {k: v for k, v in p.items() if k not in ("loc_eps", "mc_eps")}
+    scorer.set_params(**{k: p[k] for k in PARAM_KEYS if k in p})
+    weights = {k: v for k, v in p.items() if k not in PARAM_KEYS}
     cands = scorer.candidates(weights, fcfg["k"], fcfg["batch_size"], fcfg["loc_mask_min_p"])
     keep = set(val.queries["query_id"])
     return evaluate({q: c for q, c in cands.items() if q in keep}, val)
@@ -54,10 +54,11 @@ def run_study(scorer: LinearScorer, val: ValSet, base: dict, cfg: dict, n_trials
 
     Первым trial ставятся базовые параметры, чтобы подбор не мог оказаться хуже исходной точки.
     """
-    space = cfg["tune"]["space"]
+    space = cfg["tune"]["spaces"][cfg["tune"]["use_space"]] if cfg["tune"].get("use_space") else cfg["tune"]["space"]
     study = optuna.create_study(direction="maximize",
                                 sampler=optuna.samplers.TPESampler(seed=cfg["seed"]))
-    study.enqueue_trial({k: base[k] for k in space})
+    # Стартовая точка: для «<имя>_agg», которого нет в базе, — значение «<имя>».
+    study.enqueue_trial({k: base.get(k, base.get(k.removesuffix("_agg"))) for k in space})
 
     def objective(trial: optuna.Trial) -> float:
         t0 = time.time()
@@ -78,9 +79,11 @@ def main() -> None:
     parser.add_argument("--variant", default="ctx", choices=["ctx", "ql"])
     parser.add_argument("--trials", type=int, default=None)
     parser.add_argument("--tag", default="", help="суффикс имени reports/tune_<вариант><tag>.json")
+    parser.add_argument("--space", default=None, help="именованное пространство из tune.spaces")
     parser.add_argument("--set", action="append", default=[], help="правка конфига a.b=значение")
     args = parser.parse_args()
     cfg = apply_overrides(io.load_config(args.config), args.set)
+    cfg["tune"]["use_space"] = args.space
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     n_trials = args.trials or cfg["tune"]["n_trials"]
 
@@ -88,8 +91,7 @@ def main() -> None:
     queries, train = load_query_set(cfg, "val", args.variant)
     scorer = pipe.scorer(pipe.prepare(queries, train))
     val = load_val(cfg, args.variant)
-    base = {**cfg["fusion"]["weights"], "loc_eps": cfg["priors"]["loc"]["eps"],
-            "mc_eps": cfg["priors"]["mc"]["eps"]}
+    base = {**cfg["fusion"]["weights"], **default_params(cfg)}
 
     ids_a, ids_b = split_halves(val, cfg["seed"])
     val_a, val_b = subset_val(val, ids_a), subset_val(val, ids_b)
@@ -109,7 +111,8 @@ def main() -> None:
 
     out = Path(cfg["paths"]["reports_dir"]) / f"tune_{args.variant}{args.tag}.json"
     out.write_text(json.dumps({
-        "space": cfg["tune"]["space"], "n_trials": n_trials, "base": base,
+        "space": cfg["tune"]["spaces"][args.space] if args.space else cfg["tune"]["space"],
+        "n_trials": n_trials, "base": base,
         "half_a_best": best_a, "half_a_value": study_a.best_value,
         "half_b_base": b_base, "half_b_tuned_on_a": b_best,
         "full_best": best, "full_base_bench_adj": res_base["bench_adj"],

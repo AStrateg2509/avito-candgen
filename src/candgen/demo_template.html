@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Кандидатогенерация — демо</title>
+<style>
+  /* Токены светлой темы; тёмная переопределяет только их. Цвета источников —
+     фиксированный порядок категориальной палитры (skill dataviz). */
+  :root {
+    color-scheme: light;
+    --bg: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e; --muted: #898781;
+    --line: #e1e0d9; --axis: #c3c2b7; --hit: #006300; --miss: #d03b3b; --sel: rgba(42,120,214,.10);
+    --s0: #2a78d6; --s1: #eb6834; --s2: #1baf7a; --s3: #eda100; --s4: #e87ba4; --s5: #008300; --s6: #4a3aa7; --s7: #e34948;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --bg: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink2: #c3c2b7; --muted: #898781;
+      --line: #2c2c2a; --axis: #383835; --hit: #0ca30c; --miss: #e66767; --sel: rgba(57,135,229,.18);
+      --s0: #3987e5; --s1: #d95926; --s2: #199e70; --s3: #c98500; --s4: #d55181; --s5: #008300; --s6: #9085e9; --s7: #e66767;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--ink2); margin: 0 0 12px; }
+  .tiles { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  .tile { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; min-width: 120px; }
+  .tile b { display: block; font-size: 20px; }
+  .tile span { color: var(--ink2); font-size: 12px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 0 0 12px; color: var(--ink2); font-size: 13px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  .controls input, .controls select { font: inherit; padding: 5px 8px; border: 1px solid var(--axis);
+    border-radius: 6px; background: var(--surface); color: var(--ink); }
+  .controls input { flex: 1 1 220px; }
+  .layout { display: grid; grid-template-columns: minmax(240px, 320px) 1fr; gap: 12px; align-items: start; }
+  @media (max-width: 800px) { .layout { grid-template-columns: 1fr; } }
+  .list { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; max-height: 80vh; overflow: auto; }
+  .q { padding: 8px 10px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  .q:hover, .q.active { background: var(--sel); }
+  .q .t { font-weight: 600; }
+  .badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
+  .badge { font-size: 11px; color: var(--ink2); border: 1px solid var(--line); border-radius: 10px; padding: 0 6px; }
+  .ok { color: var(--hit); font-weight: 600; } .ko { color: var(--miss); font-weight: 600; }
+  .detail { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
+  .meta { color: var(--ink2); margin: 2px 0 10px; }
+  .rel { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th { text-align: left; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--axis); padding: 4px 6px; white-space: nowrap; }
+  td { border-bottom: 1px solid var(--line); padding: 4px 6px; vertical-align: middle; }
+  tr.relevant td { background: var(--sel); }
+  td.title { max-width: 360px; }
+  td.src { border-left: 4px solid transparent; }
+  .num { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+  .bars { display: flex; gap: 3px; }
+  .bar { position: relative; width: 38px; height: 12px; background: var(--bg); border-radius: 2px; }
+  .bar::after { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--axis); }
+  .bar span { position: absolute; top: 2px; bottom: 2px; border-radius: 2px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<h1>Кандидатогенерация Авито — демо на валидации</h1>
+<p class="sub">Запросы отложены из train; «релевантные» — объявления, выбранные в отложенной группе. Показаны top-<span id="k"></span> итогового пайплайна и вклад каждого слагаемого скора.</p>
+<div class="tiles" id="tiles"></div>
+<div class="legend" id="legend"></div>
+<div class="controls">
+  <input id="search" type="search" placeholder="Поиск по тексту запроса…" aria-label="Поиск по тексту запроса">
+  <select id="fSlice" aria-label="Срез"><option value="">seen и unseen</option><option value="seen">seen</option><option value="unseen">unseen</option></select>
+  <select id="fHit" aria-label="Итог"><option value="">попадания и промахи</option><option value="hit">найдено</option><option value="miss">промах</option></select>
+  <select id="fLoc" aria-label="Тип локации"><option value="">города и регионы</option><option value="city">город</option><option value="agg">регион-агрегат</option></select>
+  <select id="fFilt" aria-label="Фильтр"><option value="">с фильтром и без</option><option value="1">с фильтром</option><option value="0">без фильтра</option></select>
+</div>
+<div class="layout">
+  <div class="list" id="list" role="listbox" aria-label="Запросы"></div>
+  <div class="detail" id="detail"></div>
+</div>
+<script>
+const DATA = /*__DATA__*/null;
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const color = (i) => `var(--s${i})`;
+const srcIdx = Object.fromEntries(DATA.sources.map((s, i) => [s.key, i]));
+
+$("k").textContent = DATA.k;
+const tiles = [["bench_adj", "главная метрика"], ["weighted", "unseen и seen в долях бенчмарка"], ["unseen", "unseen"], ["seen", "seen"]];
+$("tiles").innerHTML = tiles.map(([m, l]) => `<div class="tile"><b>${DATA.metrics[m].toFixed(4)}</b><span>${m} — ${l}</span></div>`).join("");
+$("legend").innerHTML = DATA.sources.map((s, i) =>
+  `<span><i style="background:${color(i)}"></i>${esc(s.label)} × ${DATA.weights[s.key]}</span>`).join("");
+
+let current = null;
+function filtered() {
+  const q = $("search").value.trim().toLowerCase(), sl = $("fSlice").value, h = $("fHit").value,
+        lt = $("fLoc").value, f = $("fFilt").value;
+  return DATA.queries.filter((x) =>
+    (!q || x.query.toLowerCase().includes(q)) && (!sl || x.slice === sl) &&
+    (!h || (h === "hit") === (x.recall > 0)) && (!lt || (lt === "agg") === x.is_agg) &&
+    (!f || (f === "1") === (x.filter.trim() !== "")));
+}
+function renderList() {
+  const items = filtered();
+  $("list").innerHTML = items.map((x) => `
+    <div class="q ${current === x.qid ? "active" : ""}" data-q="${x.qid}" role="option" tabindex="0">
+      <div class="t">${esc(x.query)} <span class="${x.recall > 0 ? "ok" : "ko"}">${x.recall > 0 ? "✓" : "✗"}</span></div>
+      <div class="badges"><span class="badge">${x.slice}</span>${x.filter.trim() ? '<span class="badge">фильтр</span>' : ""}${x.is_agg ? '<span class="badge">регион</span>' : ""}<span class="badge">recall ${x.recall.toFixed(2)}</span></div>
+    </div>`).join("") || '<div class="q">Ничего не найдено</div>';
+  for (const el of $("list").querySelectorAll("[data-q]")) {
+    el.onclick = () => show(el.dataset.q);
+    el.onkeydown = (e) => { if (e.key === "Enter") show(el.dataset.q); };
+  }
+}
+function bars(c, scale) {
+  return '<div class="bars">' + DATA.sources.map((s, i) => {
+    const v = c.parts[s.key] ?? 0, w = scale[s.key] ? Math.min(50, 50 * Math.abs(v) / scale[s.key]) : 0;
+    const pos = v >= 0 ? `left:50%;width:${w}%` : `right:50%;width:${w}%`;
+    return `<div class="bar" title="${esc(s.label)}: ${v.toFixed(4)}"><span style="${pos};background:${color(i)}"></span></div>`;
+  }).join("") + "</div>";
+}
+function show(qid) {
+  current = qid;
+  const x = DATA.queries.find((q) => q.qid === qid);
+  const scale = {};
+  for (const s of DATA.sources) scale[s.key] = Math.max(...x.cands.map((c) => Math.abs(c.parts[s.key] ?? 0)), 1e-9);
+  const rel = x.rel.map((r) => `<div><span class="${r.found ? "ok" : "ko"}">${r.found ? "✓ найдено" : "✗ пропущено"}</span>
+      — место ${r.rank}: ${esc(r.title)} <span class="badge">лок. ${r.loc}</span> <span class="badge">подкат. ${r.mc}</span></div>`).join("");
+  const rows = x.cands.map((c, j) => `
+    <tr class="${c.relevant ? "relevant" : ""}">
+      <td class="num src" style="border-left-color:${c.main ? color(srcIdx[c.main]) : "transparent"}">${j + 1}</td>
+      <td class="title">${c.relevant ? '<span class="ok">✓</span> ' : ""}${esc(c.title)}</td>
+      <td class="num">${c.loc}</td><td class="num">${c.mc}</td><td class="num">${c.score.toFixed(3)}</td>
+      <td>${bars(c, scale)}</td>
+    </tr>`).join("");
+  $("detail").innerHTML = `
+    <h2 style="margin:0;font-size:18px">«${esc(x.query)}»</h2>
+    <div class="meta">локация ${x.loc} (${x.is_agg ? "регион-агрегат" : "город"}) · ${x.slice} · ячейка ${x.cell}
+      · recall@${DATA.k} = <b>${x.recall.toFixed(2)}</b>${x.filter.trim() ? ` · фильтр: «${esc(x.filter)}»` : " · без фильтра"}</div>
+    <div><b>Релевантные</b></div><div class="rel">${rel}</div>
+    <div class="scroll"><table>
+      <thead><tr><th>#</th><th>объявление</th><th>лок.</th><th>подкат.</th><th>скор</th><th>вклад слагаемых</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    <div class="hint">Полоса слева от номера — главный текстовый источник кандидата. Столбики: вправо — положительный вклад,
+      влево — отрицательный (приоры — логарифмы вероятностей); масштаб — по каждому слагаемому внутри запроса. Наведите на столбик, чтобы увидеть число.</div>`;
+  renderList();
+}
+for (const id of ["search", "fSlice", "fHit", "fLoc", "fFilt"]) $(id).addEventListener("input", renderList);
+renderList();
+const first = filtered()[0];
+if (first) show(first.qid);
+</script>
+</body>
+</html>
