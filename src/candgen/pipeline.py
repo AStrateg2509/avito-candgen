@@ -24,9 +24,11 @@ import pandas as pd
 import yaml
 
 from candgen import io
-from candgen.fusion import Components, LinearScorer
+from candgen.fusion import Components, LinearScorer, quota_fuse, rrf_fuse
 from candgen.priors import FilterPrior, LocationPrior, MicrocatPrior
-from candgen.retrievers.lexical import build_or_load_corpus_index, restrict_to_queries
+from candgen.retrievers.dense import DenseModel, item_embeddings
+from candgen.retrievers.lexical import HashedTfidf, build_or_load_corpus_index, restrict_to_queries
+from candgen.retrievers.memory import expansion_texts, memory_matrix
 from candgen.text import Lemmatizer, build_doc_texts, normalize_series
 from candgen.torch_utils import get_device
 from candgen.validation import evaluate, format_report, load_train_rest_mask, load_val
@@ -151,8 +153,32 @@ class Pipeline:
         t["filter"] = time.time() - t0
         t["filter_pairs"] = len(needles)
 
+        # История train: память по тексту запроса и doc expansion (строятся по
+        # переданной части train, поэтому не кэшируются на диск).
+        t0 = time.time()
+        mcfg = cfg["memory"]
+        sparse = {"memory": memory_matrix(queries, train, items["item_id"].to_numpy(), mcfg["same_loc_bonus"])}
+        exp_model = HashedTfidf("expansion", mcfg["expansion_source"], cfg["lexical"]["sublinear_tf"])
+        X_exp = exp_model.fit_transform(expansion_texts(train, items["item_id"].to_numpy(),
+                                                        mcfg["expansion_max_queries"]),
+                                        cfg["n_jobs"], cfg["lexical"]["chunk_size"]).tocsc()
+        text["expansion"] = restrict_to_queries(X_exp, exp_model.transform(qn))
+        del X_exp
+        t["memory+expansion"] = time.time() - t0
+        t["memory_queries"] = int((sparse["memory"].getnnz(axis=1) > 0).sum())
+
+        dense = {}
+        for name in cfg["dense"]["active"]:
+            t0 = time.time()
+            dcfg = cfg["dense"]
+            model = DenseModel(name, dcfg["models"][name], self.device, dcfg["fp16"], dcfg["batch_size"])
+            E = item_embeddings(cfg, name, model, items)
+            dense[name] = (E, model.encode_queries(queries["search_query"].fillna("").astype(str).tolist()))
+            model.close()
+            t[f"dense_{name}"] = time.time() - t0
+
         return Components(queries["query_id"].tolist(), self.item_ids, text, P, q_loc_idx,
-                          item_loc_idx, mc_P, item_mc_idx, W, F, t)
+                          item_loc_idx, mc_P, item_mc_idx, W, F, t, dense, sparse)
 
     def scorer(self, comp: Components) -> LinearScorer:
         """LinearScorer с eps из конфига."""
@@ -165,11 +191,14 @@ def summary_line(name: str, res: dict) -> str:
     c = res["cells"]
     return (f"| {name} | **{res['bench_adj']:.4f}** | {res['weighted']:.4f} | {res['unseen']:.4f} | "
             f"{res['seen']:.4f} | {c['seen_filter']['recall']:.4f} | {c['seen_nofilter']['recall']:.4f} | "
-            f"{c['unseen_filter']['recall']:.4f} | {c['unseen_nofilter']['recall']:.4f} |")
+            f"{c['unseen_filter']['recall']:.4f} | {c['unseen_nofilter']['recall']:.4f} | "
+            f"{res['item_in_rest']:.4f} | {res['item_new']:.4f} |")
 
 
-SUMMARY_HEADER = ("| конфиг | bench_adj | weighted | unseen | seen | seen_f | seen_nf | unseen_f | unseen_nf |\n"
-                  "|---|---|---|---|---|---|---|---|---|")
+# item_rest / item_new — micro-recall по релевантным объявлениям, которые
+# встречались / не встречались в остатке train (история помогает только первым).
+SUMMARY_HEADER = ("| конфиг | bench_adj | weighted | unseen | seen | seen_f | seen_nf | unseen_f | unseen_nf "
+                  "| item_rest | item_new |\n|---|---|---|---|---|---|---|---|---|---|---|")
 
 
 def main() -> None:
@@ -200,8 +229,17 @@ def main() -> None:
     res = None
     for run in runs:
         t1 = time.time()
-        cands = scorer.candidates(run["weights"], fcfg["k"], fcfg["batch_size"],
-                                  run.get("loc_mask_min_p", fcfg["loc_mask_min_p"]))
+        method = run.get("method", "linear")
+        if method == "linear":
+            cands = scorer.candidates(run["weights"], fcfg["k"], fcfg["batch_size"],
+                                      run.get("loc_mask_min_p", fcfg["loc_mask_min_p"]))
+        elif method == "rrf":
+            cands = scorer.to_candidates(rrf_fuse(scorer, run["channels"], fcfg["k"], run.get("depth", 200),
+                                                  run.get("k_rrf", 60.0), fcfg["batch_size"]))
+        elif method == "quota":
+            cands = scorer.to_candidates(quota_fuse(scorer, run["channels"], fcfg["k"], fcfg["batch_size"]))
+        else:
+            raise ValueError(f"неизвестный метод слияния {method}")
         res = evaluate(cands, val)
         print(summary_line(run["name"], res) + f"  ({time.time() - t1:.1f} с)")
     print("\n" + format_report(res))

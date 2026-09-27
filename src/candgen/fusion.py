@@ -38,7 +38,9 @@ class Components:
                каждого запроса; item_loc_idx — столбец для каждого объявления;
     mc_P     — P_mc [n_q × n_mc]; item_mc_idx — столбец для каждого объявления;
     filt_W, filt_F — бонус фильтра = filt_W @ filt_F  ([n_q × n_p] @ [n_p × N]);
-    timings  — время подготовки частей (для отчёта).
+    timings  — время подготовки частей (для отчёта);
+    dense    — {модель: (эмбеддинги корпуса [N × d], эмбеддинги запросов [n_q × d])}, fp16;
+    sparse   — {источник: разреженная матрица скоров [n_q × N]} (например, память train).
     """
     query_ids: list[str]
     item_ids: np.ndarray
@@ -51,6 +53,8 @@ class Components:
     filt_W: np.ndarray
     filt_F: np.ndarray
     timings: dict = field(default_factory=dict)
+    dense: dict[str, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
+    sparse: dict[str, sp.csr_matrix] = field(default_factory=dict)
 
 
 class LinearScorer:
@@ -73,6 +77,9 @@ class LinearScorer:
         self.i_mc = torch.from_numpy(comp.item_mc_idx).long().to(device)
         self.filt_W = torch.from_numpy(comp.filt_W).to(device)
         self.filt_F = torch.from_numpy(comp.filt_F.astype(np.float32)).to(device)
+        self.dense = {name: (torch.from_numpy(E).to(device), torch.from_numpy(Q).to(device))
+                      for name, (E, Q) in comp.dense.items()}
+        self.sparse = comp.sparse  # строки батча уплотняются на лету
         self.set_eps(loc_eps, mc_eps)
 
     def set_eps(self, loc_eps: float, mc_eps: float) -> None:
@@ -93,6 +100,14 @@ class LinearScorer:
             w = weights.get(name, 0.0)
             if w:
                 S.add_(torch.sparse.mm(X, dense_batch_T(Q, rows, self.device)).T, alpha=w)
+        for name, (E, Q) in self.dense.items():
+            w = weights.get(name, 0.0)
+            if w:
+                S.add_((Q[rows] @ E.T).float(), alpha=w)  # косинус: векторы L2-нормированы
+        for name, M in self.sparse.items():
+            w = weights.get(name, 0.0)
+            if w:
+                S.add_(torch.from_numpy(M[rows].toarray()).to(self.device), alpha=w)
         q_loc = self.q_loc[rows]
         if weights.get("loc", 0.0):
             S.add_(self.loc_logP[q_loc][:, self.i_loc], alpha=weights["loc"])
@@ -126,5 +141,76 @@ class LinearScorer:
                    loc_mask_min_p: float | None = None) -> dict[str, list[str]]:
         """То же, что topk, но в формате {query_id: [item_id, ...]} для evaluate/сабмита."""
         idx, _ = self.topk(weights, k, batch_size, loc_mask_min_p)
+        return self.to_candidates(idx)
+
+    def to_candidates(self, idx: np.ndarray) -> dict[str, list[str]]:
+        """Матрица индексов объявлений [n_q × k] -> {query_id: [item_id, ...]}."""
         ids = self.comp.item_ids
         return {qid: ids[row].tolist() for qid, row in zip(self.comp.query_ids, idx)}
+
+
+# --------------------------------------------------------------------------
+# Слияние по каналам: RRF и квоты (альтернативы линейной сумме)
+# --------------------------------------------------------------------------
+# Канал — это набор весов для LinearScorer (например, «лексика + приоры»
+# или «dense + приоры»). Каждый канал даёт свой ранжированный top-depth,
+# потом списки объединяются. Приоры входят в каждый канал.
+
+def rrf_fuse(scorer: LinearScorer, channels: dict, k: int = 50, depth: int = 200,
+             k_rrf: float = 60.0, batch_size: int = 512) -> np.ndarray:
+    """Reciprocal Rank Fusion с весами каналов.
+
+    score(d) = Σ_c w_c / (k_rrf + rank_c(d)), rank с 1; документ вне top-depth
+    канала вклада от него не получает.
+
+    Вход: скорер; {канал: {"weights": {...}, "w": вес канала}}; итоговый k;
+          глубина списков каналов; константа RRF.
+    Выход: индексы объявлений [n_q × k].
+    """
+    lists, ws = [], []
+    for ch in channels.values():
+        idx, _ = scorer.topk(ch["weights"], depth, batch_size)
+        lists.append(idx)
+        ws.append(ch.get("w", 1.0))
+    contrib = np.concatenate([np.broadcast_to(w / (k_rrf + np.arange(1, depth + 1)), (lists[0].shape[0], depth))
+                              for w in ws], axis=1)
+    allidx = np.concatenate(lists, axis=1)
+    out = np.empty((allidx.shape[0], k), dtype=np.int64)
+    for qi in range(allidx.shape[0]):
+        uniq, inv = np.unique(allidx[qi], return_inverse=True)
+        score = np.bincount(inv, weights=contrib[qi])
+        # сортировка по убыванию скора; при равенстве — по индексу (детерминированно)
+        out[qi] = uniq[np.lexsort((uniq, -score))[:k]]
+    return out
+
+
+def quota_fuse(scorer: LinearScorer, channels: dict, k: int = 50, batch_size: int = 512) -> np.ndarray:
+    """Квоты: из каждого канала по порядку берутся первые n_c новых кандидатов,
+    затем список добивается первым каналом до k.
+
+    Вход: скорер; {канал: {"weights": {...}, "n": квота}} (порядок важен);
+          итоговый k.
+    Выход: индексы объявлений [n_q × k].
+    """
+    tops = [scorer.topk(ch["weights"], k, batch_size)[0] for ch in channels.values()]
+    quotas = [ch["n"] for ch in channels.values()]
+    out = np.empty((tops[0].shape[0], k), dtype=np.int64)
+    for qi in range(out.shape[0]):
+        chosen, seen = [], set()
+        for top, n in zip(tops, quotas):
+            taken = 0
+            for d in top[qi]:
+                if taken >= n:
+                    break
+                if d not in seen:
+                    chosen.append(d)
+                    seen.add(d)
+                    taken += 1
+        for d in tops[0][qi]:  # добивка основным каналом
+            if len(chosen) >= k:
+                break
+            if d not in seen:
+                chosen.append(d)
+                seen.add(d)
+        out[qi] = chosen[:k]
+    return out

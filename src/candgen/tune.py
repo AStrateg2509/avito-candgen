@@ -77,6 +77,7 @@ def main() -> None:
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--variant", default="ctx", choices=["ctx", "ql"])
     parser.add_argument("--trials", type=int, default=None)
+    parser.add_argument("--tag", default="", help="суффикс имени reports/tune_<вариант><tag>.json")
     parser.add_argument("--set", action="append", default=[], help="правка конфига a.b=значение")
     args = parser.parse_args()
     cfg = apply_overrides(io.load_config(args.config), args.set)
@@ -106,7 +107,7 @@ def main() -> None:
     print(f"\nВся валидация: исходные {res_base['bench_adj']:.4f} -> {res_best['bench_adj']:.4f}")
     print("Лучшие параметры:", {k: round(v, 5) for k, v in best.items()})
 
-    out = Path(cfg["paths"]["reports_dir"]) / f"tune_{args.variant}.json"
+    out = Path(cfg["paths"]["reports_dir"]) / f"tune_{args.variant}{args.tag}.json"
     out.write_text(json.dumps({
         "space": cfg["tune"]["space"], "n_trials": n_trials, "base": base,
         "half_a_best": best_a, "half_a_value": study_a.best_value,

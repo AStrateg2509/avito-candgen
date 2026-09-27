@@ -128,6 +128,27 @@ def build_doc_texts(items: pd.DataFrame, docs_cfg: dict) -> list[str]:
     return [normalize_query(t) for t in joined]
 
 
+def build_raw_doc_texts(items: pd.DataFrame, fields: list[dict]) -> list[str]:
+    """Сырой текст объявления для dense-модели: поля через «. », без нормализации.
+
+    Трансформеры сами работают с регистром и пунктуацией, а нормализация
+    (удаление знаков, ё→е) только уводила бы текст от того, на чём модель училась.
+
+    Вход: корпус; список полей {col, max_chars} (секция dense.doc_fields).
+    Выход: список строк в порядке строк items.
+    """
+    parts = []
+    for field in fields:
+        col = items[field["col"]].fillna("").astype(str)
+        if field.get("max_chars"):
+            col = col.str.slice(0, field["max_chars"])
+        parts.append(col)
+    joined = parts[0]
+    for p in parts[1:]:
+        joined = joined + ". " + p
+    return joined.str.strip(" .").tolist()
+
+
 def _remove_noise(text: str, patterns: list[re.Pattern]) -> str:
     """Вырезает из строки параметров все фрагменты, подходящие под регулярки шума."""
     for p in patterns:

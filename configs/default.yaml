@@ -107,15 +107,59 @@ lexical:
     #   fields:
     #     - {col: item_title_raw, repeat: 1, max_chars: null}
 
+# ---------------------------------------------------------------- этап 3 ---
+# Dense-поиск (sentence-transformers). Модели скачиваются ОДИН раз скриптом
+# scripts/download_models.sh в models/hf; при запуске сеть не используется
+# (HF_HUB_OFFLINE=1). Вес модели в fusion.weights — по её имени (e5_base, ...).
+dense:
+  # Какие модели участвуют в скоринге (имена из models). e5_base проверен на
+  # этапе 3: поверх USER-base даёт 0.12 п.п. (< 0.3) — выключен.
+  active: [user_base]
+  batch_size: 256
+  fp16: true
+  # Текст документа для dense: сырые поля через «. » (без нормализации —
+  # трансформер сам работает с регистром и пунктуацией).
+  doc_fields:
+    - {col: item_title_raw, max_chars: null}
+    - {col: item_infm_params_text, max_chars: 300}
+  models:
+    e5_base:
+      hf_id: intfloat/multilingual-e5-base
+      query_prefix: 'query: '
+      doc_prefix: 'passage: '
+      max_len: 128
+    user_base:
+      hf_id: deepvk/USER-base
+      query_prefix: 'query: '
+      doc_prefix: 'passage: '
+      max_len: 128
+    e5_small:
+      hf_id: intfloat/multilingual-e5-small
+      query_prefix: 'query: '
+      doc_prefix: 'passage: '
+      max_len: 128
+
+# История train (src/candgen/retrievers/memory.py). Веса — memory и expansion
+# в fusion.weights.
+memory:
+  same_loc_bonus: 1.0     # доп. вес кликов того же текста в той же локации
+  expansion_max_queries: 30   # сколько самых частых запросов приписывать объявлению
+  # Настройки char TF-IDF для doc expansion (IDF — по документам расширения).
+  expansion_source:
+    analyzer: char_wb
+    ngram_range: [3, 5]
+    n_features: 4194304
+    lemmatize: false
+
 priors:
   loc:
-    eps: 3.0e-5           # score += α·log(P(item_loc | search_loc) + eps); подобрано (ТЗ: 1e-4)
+    eps: 3.0e-6           # score += α·log(P(item_loc | search_loc) + eps); подобрано (ТЗ: 1e-4)
     fallback: self        # локации поиска нет в train: self — P=1 своей, uniform — равномерно
   mc:
     k: 20                 # соседей среди текстов train (char 2–4 TF-IDF)
     ngram_range: [2, 4]
     power: 1.0            # вес соседа = sim**power
-    eps: 1.3e-3           # score += β·log(P_mc + eps); подобрано (ТЗ: 1e-3)
+    eps: 8.6e-4           # score += β·log(P_mc + eps); подобрано (ТЗ: 1e-3)
   filter:
     match: pair           # pair: «ключ значение» ⊂ параметров; value: только значение
     key_weights: {Вид услуги: 0.5, Тип услуги: 0.5}
@@ -124,19 +168,26 @@ fusion:
   k: 50
   batch_size: 512
   # score = Σ w_src·cos_src + loc·logP_loc + mc·logP_mc + filter·bonus
-  # Подобраны Optuna на всей валидации (reports/tune_ctx.json); на отложенной
-  # половине B подбор дал +1.47 п.п. bench_adj. Исходный baseline ТЗ:
-  # {char: 1.0, loc: 0.05, mc: 0.03, filter: 0.2}, eps 1e-4 / 1e-3.
-  weights: {char: 1.0, word: 0.52, title: 0.0, loc: 0.052, mc: 0.013, filter: 0.74}
+  # Этап 3: подобраны Optuna на всей валидации (reports/tune_ctx.json, 60+60
+  # trials); на отложенной половине B подбор дал +1.85 п.п. bench_adj.
+  # Этап 2: {char 1, word 0.52, loc 0.052, mc 0.013, filter 0.74}, eps 3e-5 / 1.3e-3.
+  # Baseline ТЗ: {char 1, loc 0.05, mc 0.03, filter 0.2}, eps 1e-4 / 1e-3.
+  # e5_base выключен: без него −0.12 п.п. (< 0.3) — одна dense-модель проще.
+  weights: {char: 1.0, word: 0.61, title: 0.0, e5_base: 0.0, user_base: 0.22, expansion: 0.39,
+            memory: 0.0, loc: 0.067, mc: 0.012, filter: 0.31}
   # Вариант (b): объявления с P_loc(item_loc | search_loc) ниже порога
   # получают штраф −1e4 (фактически исключаются). null — вариант (a), весь корпус.
   loc_mask_min_p: null
 
 # Подбор весов (python -m candgen.tune): [низ, верх, шкала]; char = 1 — масштаб.
+# Этап 3: добавлены dense (e5_base, user_base) и doc expansion; память не
+# подбирается (вклад ≈ 0, см. EXPERIMENTS.md).
 tune:
-  n_trials: 50
+  n_trials: 60
   space:
     word: [0.0, 1.0, uniform]
+    user_base: [0.0, 1.5, uniform]
+    expansion: [0.0, 0.8, uniform]
     loc: [0.01, 0.3, log]
     mc: [0.005, 0.2, log]
     filter: [0.02, 1.0, log]
@@ -172,6 +223,59 @@ experiments:
     - {name: +title 0.3, weights: {char: 1.0, word: 0.0, title: 0.3, loc: 0.05, mc: 0.03, filter: 0.2}}
     - {name: +title 0.6, weights: {char: 1.0, word: 0.0, title: 0.6, loc: 0.05, mc: 0.03, filter: 0.2}}
     - {name: +title 1.0, weights: {char: 1.0, word: 0.0, title: 1.0, loc: 0.05, mc: 0.03, filter: 0.2}}
+  # Этап 3 (нужен dense.active: [e5_base, user_base]).
+  stage3:
+    - {name: итог этапа 2, weights: &stage2 {char: 1.0, word: 0.52, loc: 0.052, mc: 0.013, filter: 0.74}}
+    - {name: char без приоров, weights: {char: 1.0}}
+    - {name: e5_base без приоров, weights: {e5_base: 1.0}}
+    - {name: user_base без приоров, weights: {user_base: 1.0}}
+    - {name: e5_base + приоры, weights: {e5_base: 1.0, loc: 0.052, mc: 0.013, filter: 0.74}}
+    - {name: e5_base×3 + приоры, weights: {e5_base: 3.0, loc: 0.052, mc: 0.013, filter: 0.74}}
+    - {name: user_base + приоры, weights: {user_base: 1.0, loc: 0.052, mc: 0.013, filter: 0.74}}
+    - {name: user_base×3 + приоры, weights: {user_base: 3.0, loc: 0.052, mc: 0.013, filter: 0.74}}
+    - {name: этап 2 + e5_base 0.5, weights: {char: 1.0, word: 0.52, e5_base: 0.5, loc: 0.052, mc: 0.013, filter: 0.74}}
+    - {name: этап 2 + user_base 0.5, weights: {char: 1.0, word: 0.52, user_base: 0.5, loc: 0.052, mc: 0.013, filter: 0.74}}
+    - {name: этап 2 + memory 0.5, weights: {char: 1.0, word: 0.52, memory: 0.5, loc: 0.052, mc: 0.013, filter: 0.74}}
+    - {name: этап 2 + memory 2, weights: {char: 1.0, word: 0.52, memory: 2.0, loc: 0.052, mc: 0.013, filter: 0.74}}
+    - {name: этап 2 + expansion 0.3, weights: {char: 1.0, word: 0.52, expansion: 0.3, loc: 0.052, mc: 0.013, filter: 0.74}}
+    - {name: этап 2 + expansion 0.7, weights: {char: 1.0, word: 0.52, expansion: 0.7, loc: 0.052, mc: 0.013, filter: 0.74}}
+  stage3_items:
+    - {name: итог этапа 2, weights: *stage2}
+    - {name: + expansion 0.15, weights: {char: 1.0, word: 0.52, expansion: 0.15, loc: 0.052, mc: 0.013, filter: 0.74}}
+    - {name: + expansion 0.3, weights: {char: 1.0, word: 0.52, expansion: 0.3, loc: 0.052, mc: 0.013, filter: 0.74}}
+    - {name: + user_base 0.5, weights: {char: 1.0, word: 0.52, user_base: 0.5, loc: 0.052, mc: 0.013, filter: 0.74}}
+    - {name: + user_base 0.5 + e5_base 0.5, weights: {char: 1.0, word: 0.52, user_base: 0.5, e5_base: 0.5, loc: 0.052, mc: 0.013, filter: 0.74}}
+    - {name: + user_base 0.5 + expansion 0.3, weights: {char: 1.0, word: 0.52, user_base: 0.5, expansion: 0.3, loc: 0.052, mc: 0.013, filter: 0.74}}
+  stage3_final:  # требует dense.active: [e5_base, user_base]
+    - {name: итог этапа 3 (линейное), weights: &stage3 {char: 1.0, word: 0.61, e5_base: 0.64, user_base: 0.22, expansion: 0.39, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: − expansion («безопасный»), weights: {char: 1.0, word: 0.61, e5_base: 0.64, user_base: 0.22, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: − e5_base, weights: {char: 1.0, word: 0.61, user_base: 0.22, expansion: 0.39, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: − user_base, weights: {char: 1.0, word: 0.61, e5_base: 0.64, expansion: 0.39, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: − оба dense, weights: {char: 1.0, word: 0.61, expansion: 0.39, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: − word, weights: {char: 1.0, e5_base: 0.64, user_base: 0.22, expansion: 0.39, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: − filter, weights: {char: 1.0, word: 0.61, e5_base: 0.64, user_base: 0.22, expansion: 0.39, loc: 0.067, mc: 0.012}}
+    - {name: − mc, weights: {char: 1.0, word: 0.61, e5_base: 0.64, user_base: 0.22, expansion: 0.39, loc: 0.067, filter: 0.31}}
+    - {name: + memory 0.5, weights: {char: 1.0, word: 0.61, e5_base: 0.64, user_base: 0.22, expansion: 0.39, memory: 0.5, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - name: RRF лексика 1 / dense 1
+      method: rrf
+      channels: &channels
+        lex: {w: 1.0, weights: {char: 1.0, word: 0.61, expansion: 0.39, loc: 0.067, mc: 0.012, filter: 0.31}}
+        dense: {w: 1.0, weights: {e5_base: 1.28, user_base: 0.44, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - name: RRF лексика 1 / dense 0.5
+      method: rrf
+      channels:
+        lex: {w: 1.0, weights: {char: 1.0, word: 0.61, expansion: 0.39, loc: 0.067, mc: 0.012, filter: 0.31}}
+        dense: {w: 0.5, weights: {e5_base: 1.28, user_base: 0.44, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - name: квоты лексика 35 + dense 15
+      method: quota
+      channels:
+        lex: {n: 35, weights: {char: 1.0, word: 0.61, expansion: 0.39, loc: 0.067, mc: 0.012, filter: 0.31}}
+        dense: {n: 15, weights: {e5_base: 1.28, user_base: 0.44, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - name: квоты линейное 40 + dense 10
+      method: quota
+      channels:
+        linear: {n: 40, weights: *stage3}
+        dense: {n: 10, weights: {e5_base: 1.28, user_base: 0.44, loc: 0.067, mc: 0.012, filter: 0.31}}
   mask:
     - {name: (a) весь корпус, weights: *baseline}
     - {name: (b) P_loc ≥ 0.001, weights: *baseline, loc_mask_min_p: 0.001}
