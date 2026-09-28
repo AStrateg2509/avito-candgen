@@ -114,8 +114,9 @@ lexical:
 dense:
   # Какие модели участвуют в скоринге (имена из models). e5_base проверен на
   # этапе 3: поверх USER-base даёт 0.12 п.п. (< 0.3) — выключен. Этап 4:
-  # дообученная e5-small (фишка 7) вместо USER-base: +0.82 п.п.
-  active: [e5_small_ft]
+  # дообученная e5-small (фишка 7) вместо USER-base: +0.82 п.п. Итог (s10,
+  # LB 0.8963): e5-small, дообученная на тексте с описанием объявления.
+  active: [e5_small_ftd]
   batch_size: 256
   fp16: true
   # Текст документа для dense: сырые поля через «. » (без нормализации —
@@ -164,8 +165,8 @@ finetune:
   base_model: e5_small
   # dense-модель, чьи поля документа и max_len используются; модель
   # сохраняется в <out_dir>/<target_model>_<режим>
-  target_model: e5_small_ft
-  batch_size: 128
+  target_model: e5_small_ftd      # этап 4 (e5_small_ft) учился с batch 128
+  batch_size: 64                  # документ 256 токенов с batch 128 не помещается в 8 ГБ
   lr: 3.0e-5
   warmup_share: 0.05
   scale: 20.0             # множитель косинусов в softmax (температура 0.05)
@@ -232,8 +233,10 @@ fusion:
   # Baseline ТЗ: {char 1, loc 0.05, mc 0.03, filter 0.2}, eps 1e-4 / 1e-3.
   # e5_base выключен: без него −0.12 п.п. (< 0.3) — одна dense-модель проще.
   # Этап 4: user_base заменён дообученной e5_small_ft (стартовые веса до переподбора).
-  weights: {char: 1.0, word: 0.61, title: 0.0, e5_base: 0.0, user_base: 0.0, e5_small_ft: 0.5,
-            expansion: 0.39, memory: 0.0, loc: 0.067, mc: 0.012, filter: 0.31}
+  # Итог (s10): dense — e5_small_ftd (текст с описанием); doc expansion выключен —
+  # на холодной валидации он вредит (у релевантных теста обычно нет истории).
+  weights: {char: 1.0, word: 0.61, title: 0.0, e5_base: 0.0, user_base: 0.0, e5_small_ft: 0.0,
+            e5_small_ftd: 0.5, expansion: 0.0, memory: 0.0, loc: 0.067, mc: 0.012, filter: 0.31}
   # Вариант (b): объявления с P_loc(item_loc | search_loc) ниже порога
   # получают штраф −1e4 (фактически исключаются). null — вариант (a), весь корпус.
   loc_mask_min_p: null
@@ -272,19 +275,24 @@ crossenc:
 # top-pool_depth каналов (каждый канал — набор весов LinearScorer, приоры
 # входят во все). Обучение — cross-fitting на val-запросах (2 фолда по запросам).
 prerank:
+  # Итоговый рецепт (s10, LB 0.8963): ранкер учится на холодной валидации
+  # (ctx_cold), без expansion и без признаков истории и «качества» объявления.
+  variant: ctx_cold       # вариант валидации, на котором учится ранкер
   pool_depth: 100
   batch_size: 256
-  channels:               # "final" — текущие fusion.weights
+  channels:               # "final" — текущие fusion.weights; "skip" — канал выключен
     final: final
     char: {char: 1.0, loc: 0.067, mc: 0.012, filter: 0.31}
     word: {word: 1.0, loc: 0.067, mc: 0.012, filter: 0.31}
-    dense: {e5_small_ft: 1.0, loc: 0.067, mc: 0.012, filter: 0.31}
-    expansion: {expansion: 1.0, loc: 0.067, mc: 0.012, filter: 0.31}
+    dense: {e5_small_ftd: 1.0, loc: 0.067, mc: 0.012, filter: 0.31}
+    expansion: skip       # этап 5 (s6): {expansion: 1.0, loc: 0.067, mc: 0.012, filter: 0.31}
   valid_share: 0.2        # доля обучающих запросов фолда под early stopping
-  # Признаки, которые исключаются из ранкера (например, история объявления:
-  # item_pop, expansion, rank_expansion, q_memory_items — они помогают только
-  # объявлениям, встречавшимся в train).
-  drop_features: []
+  # Признаки, исключённые из ранкера. История объявления (item_pop, expansion,
+  # rank_expansion, q_memory_items) помогает только объявлениям из train;
+  # «качество» (отзывы, рейтинг, длины текстов) на валидации завышено смещением
+  # «выживших» объявлений. На тесте обе группы нейтральны (s6 0.8912 ≈ s9 0.8917).
+  drop_features: [item_pop, expansion, rank_expansion, q_memory_items,
+                  item_reviews, item_rating, item_desc_len, item_title_len]
   lgbm:
     objective: lambdarank
     n_estimators: 1000
@@ -296,11 +304,16 @@ prerank:
     colsample_bytree: 0.8
     reg_lambda: 1.0
     verbose: -1
+    # Воспроизводимость (рекомендация документации LightGBM). Сами по себе ответы
+    # расходились не из-за LightGBM, а из-за пула: см. float64 в torch_utils.to_torch_csr.
+    deterministic: true
+    force_col_wise: true
   early_stopping_rounds: 50
   eval_at: 50
   # Итоговый ранкер для бенчмарка: фиксированное число деревьев (среднее
   # лучших итераций cross-fitting) вместо раннего останова. null — ранний останов.
-  final_n_estimators: null
+  # Если задано, фолды cross-fitting в --mode val учатся с тем же числом деревьев.
+  final_n_estimators: 150         # фолды s10: 155 и 146
 
 # Подбор весов (python -m candgen.tune): [низ, верх, шкала]; char = 1 — масштаб.
 # Этап 3: добавлены dense (e5_base, user_base) и doc expansion; память не

@@ -127,6 +127,32 @@ class LocationPrior:
         return P, uq, ui, len(missing)
 
 
+# Запас кандидатов для детерминированного top-k и точность округления скоров.
+KNN_MARGIN = 16
+KNN_DECIMALS = 5
+
+
+def stable_topk_dim0(sims: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Детерминированный top-k по столбцам (dim=0).
+
+    torch.topk при равных и почти равных значениях выбирает соседей произвольно,
+    а sparse.mm на GPU в float32 ещё и «дрожит» в последних знаках: из-за этого
+    P_mc, а за ним пул кандидатов и ответ, различались между одинаковыми
+    запусками. Берём запас k + KNN_MARGIN кандидатов, округляем скоры до
+    KNN_DECIMALS знаков и сортируем по (−скор, индекс) двумя стабильными сортировками.
+
+    Вход: матрица скоров [n × B], k.
+    Выход: (округлённые скоры [k × B], индексы строк [k × B]).
+    """
+    m = min(k + KNN_MARGIN, sims.shape[0])
+    vals, idx = torch.topk(sims, m, dim=0)
+    vals = torch.round(vals, decimals=KNN_DECIMALS)
+    o = torch.argsort(idx, dim=0, stable=True)                  # вторичный ключ: индекс
+    vals, idx = vals.gather(0, o), idx.gather(0, o)
+    o = torch.argsort(-vals, dim=0, stable=True)[:k]            # главный ключ: −скор
+    return vals.gather(0, o), idx.gather(0, o)
+
+
 class MicrocatPrior:
     """P(подкатегория | запрос): взвешенная смесь распределений k ближайших текстов train.
 
@@ -171,13 +197,13 @@ class MicrocatPrior:
         """
         k, power = self.cfg["k"], self.cfg["power"]
         Q = self.vectorizer.transform(query_texts)
-        T = to_torch_csr(self.T, self.device)
+        T = to_torch_csr(self.T, self.device, torch.float64)  # float64 — воспроизводимость
         D = torch.from_numpy(self.D).to(self.device)
         out = np.empty((len(query_texts), D.shape[1]), dtype=np.float32)
         for start in range(0, len(query_texts), batch_size):
             rows = slice(start, min(start + batch_size, len(query_texts)))
-            sims = torch.sparse.mm(T, dense_batch_T(Q, rows, self.device))  # n_texts × B
-            vals, idx = torch.topk(sims, k, dim=0)                          # k × B
+            sims = torch.sparse.mm(T, dense_batch_T(Q, rows, self.device, T.dtype)).float()  # n_texts × B
+            vals, idx = stable_topk_dim0(sims, k)                           # k × B
             w = vals.clamp(min=0) ** power
             P = torch.einsum("kb,kbm->bm", w, D[idx])                      # B × n_mc
             s = w.sum(dim=0)

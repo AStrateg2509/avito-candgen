@@ -27,6 +27,8 @@ import torch
 from candgen.torch_utils import dense_batch_T, to_torch_csr
 
 MASK_PENALTY = 1e4
+# Запас кандидатов сверх k для детерминированной сортировки в topk.
+TOPK_MARGIN = 16
 
 
 @dataclass
@@ -80,7 +82,9 @@ class LinearScorer:
         self.comp = comp
         self.device = device
         self.n_items = len(comp.item_ids)
-        self.text = {name: (to_torch_csr(X, device), Q) for name, (X, Q) in comp.text.items()}
+        # float64: воспроизводимые текстовые скоры (см. to_torch_csr); результат
+        # батча приводится к float32, память под корпус char — +1 ГБ видеопамяти.
+        self.text = {name: (to_torch_csr(X, device, torch.float64), Q) for name, (X, Q) in comp.text.items()}
         self.loc_P_raw = torch.from_numpy(comp.loc_P).to(device)
         self.geo = {k: torch.from_numpy(v).to(device) for k, v in comp.loc_geo.items()
                     if k in ("C", "N", "D", "w")}
@@ -146,7 +150,7 @@ class LinearScorer:
         for name, (X, Q) in self.text.items():
             w = self._weight(weights, name, rows)
             if w is not None:
-                S.add_(torch.sparse.mm(X, dense_batch_T(Q, rows, self.device)).T * w)
+                S.add_(torch.sparse.mm(X, dense_batch_T(Q, rows, self.device, X.dtype)).T.float() * w)
         for name, (E, Q) in self.dense.items():
             w = self._weight(weights, name, rows)
             if w is not None:
@@ -199,10 +203,18 @@ class LinearScorer:
         n_q = len(self.comp.query_ids)
         idx = np.empty((n_q, k), dtype=np.int64)
         val = np.empty((n_q, k), dtype=np.float32)
+        extra = TOPK_MARGIN
         for start in range(0, n_q, batch_size):
             rows = slice(start, min(start + batch_size, n_q))
-            v, i = torch.topk(self.batch_scores(rows, weights, loc_mask_min_p), k, dim=1)
-            idx[rows], val[rows] = i.cpu().numpy(), v.cpu().numpy()
+            v, i = torch.topk(self.batch_scores(rows, weights, loc_mask_min_p), k + extra, dim=1)
+            v, i = v.cpu().numpy(), i.cpu().numpy()
+            # Детерминированный top-k: скоры с GPU от запуска к запуску «дрожат» в
+            # последних знаках, а torch.topk при равенстве выбирает произвольно (в
+            # корпусе много дублей объявлений). Сортируем запас кандидатов по
+            # скору, округлённому до 5 знаков, при равенстве — по индексу объявления.
+            order = np.lexsort((i, -np.round(v, 5)), axis=1)[:, :k]
+            idx[rows] = np.take_along_axis(i, order, axis=1)
+            val[rows] = np.take_along_axis(v, order, axis=1)
         return idx, val
 
     def candidates(self, weights: dict, k: int = 50, batch_size: int = 512,

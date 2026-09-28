@@ -1,18 +1,23 @@
 #!/usr/bin/env bash
-# Полный воспроизводимый прогон -> answer.csv (офлайн, одной командой).
+# Полный воспроизводимый прогон итогового рецепта (s10, LB 0.8963) -> answer.csv.
+# Офлайн, одной командой.
 #
 # Предварительно (единственные шаги с сетью, один раз):
 #   bash scripts/install.sh          # .venv и пинованные зависимости
 #   bash scripts/download_models.sh  # open-source модели в models/hf
 # Затем:
-#   bash scripts/run_all.sh          # переиспользует кэши, если они есть
-#   bash scripts/run_all.sh --clean  # всё с нуля: индексы, эмбеддинги, срезы, дообучение
+#   bash scripts/run_all.sh          # переиспользует кэши и модели, если они есть
+#   bash scripts/run_all.sh --clean  # итоговый рецепт с нуля
 #
-# Шаги: данные -> срезы валидации -> дообучение e5-small на остатке train
-# (для признаков ранкера) и на всём train (для сабмита) -> индексы, эмбеддинги,
-# приоры -> LightGBM-предранкер -> answer.csv + проверка формата.
-# У каждого шага печатается время. --clean не трогает artifacts/answers
-# (сохранённые копии сабмитов) и reports/.
+# Шаги:
+#   данные -> срезы валидации (в т.ч. ctx_cold)
+#   -> дообучение e5-small на тексте с описанием объявления: на холодном
+#      остатке train (для признаков ранкера) и на всём train (для бенчмарка)
+#   -> индексы, эмбеддинги, приоры -> LightGBM-ранкер (обучен на ctx_cold)
+#   -> answer.csv + проверка формата.
+# Все настройки рецепта — в configs/default.yaml. У каждого шага печатается время.
+# --clean удаляет кэши и модели итогового рецепта; модели исследований
+# (models/finetuned/*) и копии сабмитов (artifacts/answers) не трогает.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -31,9 +36,11 @@ step() {
     echo "=== [$name] готово за $(( $(date +%s) - t )) с"
 }
 
+DENSE=e5_small_ftd   # finetune.target_model в конфиге
 if [ "${1:-}" = "--clean" ]; then
-    echo "=== [clean] удаляю кэши и дообученные модели"
-    rm -rf artifacts/lex artifacts/dense artifacts/lemmas.parquet artifacts/val_* models/finetuned
+    echo "=== [clean] удаляю кэши и модели итогового рецепта"
+    rm -rf artifacts/lex artifacts/dense artifacts/lemmas.parquet artifacts/val_* artifacts/ce_cache \
+           "models/finetuned/${DENSE}_val_cold" "models/finetuned/${DENSE}_full"
 fi
 
 if [ ! -d models/hf/hub ]; then
@@ -43,10 +50,10 @@ fi
 
 step data bash scripts/setup_data.sh
 step splits python -m candgen.validation --build
-if [ ! -d models/finetuned/e5_small_ft_val ]; then
-    step finetune_val python -m candgen.finetune --mode val
+if [ ! -d "models/finetuned/${DENSE}_val_cold" ]; then
+    step finetune_val_cold python -m candgen.finetune --mode val_cold
 fi
-if [ ! -d models/finetuned/e5_small_ft_full ]; then
+if [ ! -d "models/finetuned/${DENSE}_full" ]; then
     step finetune_full python -m candgen.finetune --mode full
 fi
 step answer python -m candgen.prerank --mode bench

@@ -167,7 +167,11 @@ def pool_features(pipe: Pipeline, comp, scorer: LinearScorer, queries: pd.DataFr
     qi_idx, pos = np.nonzero(valid)
     df = pd.DataFrame({"qi": qi_idx, "item": pool[qi_idx, pos]})
     for name, arr in F.items():
-        df[name] = arr[qi_idx, pos]
+        # Округление до 4 знаков — страховка воспроизводимости: признаки считаются
+        # на GPU, а LightGBM к шуму в последних знаках «хаотично» чувствителен
+        # (сдвигаются границы бинов — расходятся все деревья). Главный источник
+        # такого шума, sparse.mm во float32, уже устранён (torch_utils.to_torch_csr).
+        df[name] = np.round(arr[qi_idx, pos].astype(np.float64), 4).astype(np.float32)
     if rel is not None:
         ids = comp.item_ids
         qids = np.array(comp.query_ids)
@@ -348,10 +352,16 @@ def run_val(cfg: dict, variant: str) -> None:
     half_a, half_b = split_halves(val, cfg["seed"])
     qpos = {q: i for i, q in enumerate(fv.query_ids)}
     top, importances = {}, []
+    # Если число деревьев итогового ранкера зафиксировано, фолды учатся так же:
+    # оценивается та конфигурация, что уходит в сабмит. Ранний останов по 20%
+    # запросов фолда шумный (на одной и той же модели — от 38 до 155 деревьев,
+    # bench_adj 0.919–0.924).
+    n_fixed = cfg["prerank"].get("final_n_estimators")
     for train_ids, test_ids in ((half_a, half_b), (half_b, half_a)):
         tr_qi = {qpos[q] for q in train_ids}
-        model = fit_ranker(df[df["qi"].isin(tr_qi)], cfg)
-        print(f"[prerank] фолд: лучшая итерация {model.best_iteration_}")
+        model = fit_ranker(df[df["qi"].isin(tr_qi)], cfg, n_fixed)
+        print("[prerank] фолд: " + (f"фиксировано {n_fixed} деревьев" if n_fixed
+                                    else f"лучшая итерация {model.best_iteration_}"))
         top.update(top_by_model(model, df[~df["qi"].isin(tr_qi)], k))
         importances.append(pd.Series(model.booster_.feature_importance("gain"),
                                      index=feature_columns(df)))
@@ -401,8 +411,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="LightGBM-предранкер (этап 5)")
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--mode", choices=["val", "bench", "transfer"], default="val")
-    parser.add_argument("--variant", default="ctx", choices=["ctx", "ctx_cold"],
-                        help="на каком варианте валидации учить (и оценивать в режиме val) ранкер")
+    parser.add_argument("--variant", default=None, choices=["ctx", "ctx_cold"],
+                        help="на каком варианте валидации учить (и оценивать в режиме val) ранкер; "
+                             "по умолчанию prerank.variant из конфига")
     parser.add_argument("--eval-variant", default="ctx_cold", choices=["ctx", "ctx_cold"],
                         help="режим transfer: вариант, на котором оценивается ранкер")
     parser.add_argument("--eval-set", action="append", default=[],
@@ -410,12 +421,13 @@ def main() -> None:
     parser.add_argument("--set", action="append", default=[], help="правка конфига a.b=значение")
     args = parser.parse_args()
     cfg = apply_overrides(io.load_config(args.config), args.set)
+    variant = args.variant or cfg["prerank"]["variant"]
     if args.mode == "val":
-        run_val(cfg, args.variant)
+        run_val(cfg, variant)
     elif args.mode == "bench":
-        run_bench(cfg, args.variant)
+        run_bench(cfg, variant)
     else:
-        run_transfer(cfg, args.variant, args.eval_variant, args.eval_set)
+        run_transfer(cfg, variant, args.eval_variant, args.eval_set)
 
 
 if __name__ == "__main__":
