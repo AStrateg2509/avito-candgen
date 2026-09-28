@@ -3,7 +3,7 @@
 # на холодной валидации. Нужна модель models/finetuned/crossenc_val_cold
 # (python -m candgen.crossenc --mode val_cold). База: s9 = 0.9154.
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 # shellcheck disable=SC1091
 source scripts/env.sh

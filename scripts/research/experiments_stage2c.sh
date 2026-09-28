@@ -2,7 +2,7 @@
 # Эксперименты этапа 2, серия c: длина описания в тексте документа
 # (в серии b описание 600 символов вместо 300 дало +1.45 п.п. bench_adj).
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 # shellcheck disable=SC1091
 source scripts/env.sh

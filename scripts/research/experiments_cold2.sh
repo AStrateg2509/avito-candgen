@@ -2,7 +2,7 @@
 # Калибровка холодной валидации по лидерборду (s3 линейное: LB 0.8801; s6 ранкер: LB 0.8912)
 # и ранкер, независимый от истории объявлений.
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 # shellcheck disable=SC1091
 source scripts/env.sh

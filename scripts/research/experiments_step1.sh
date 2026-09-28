@@ -3,7 +3,7 @@
 # (ранкер обучен на ctx_cold, без expansion, без истории и «качества» объявления).
 # База для сравнения: s9 на холодной валидации = 0.9154, потолок пула 0.9612.
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 # shellcheck disable=SC1091
 source scripts/env.sh

@@ -3,7 +3,7 @@
 # (ctx_cold), без expansion (в базовом скоре, в пуле и в признаках) и без
 # признаков истории объявления; второй вариант — ещё и без «качества».
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 # shellcheck disable=SC1091
 source scripts/env.sh

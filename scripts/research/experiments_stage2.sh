@@ -5,7 +5,7 @@
 #   2) вариант (a) весь корпус против (b) маски по P_loc;
 #   3) очистка параметров объявлений от служебного шума (перестраивает индексы).
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 # shellcheck disable=SC1091
 source scripts/env.sh

@@ -3,7 +3,7 @@
 # (ctx) и холодной (ctx_cold) валидации, затем предранкер на холодной.
 # Нужна модель models/finetuned/e5_small_ft_val_cold (finetune --mode val_cold).
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 # shellcheck disable=SC1091
 source scripts/env.sh

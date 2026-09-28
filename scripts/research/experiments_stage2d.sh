@@ -3,7 +3,7 @@
 #   1) desc[:2000] — должен повторить 0.8669 (проверка эквивалентности реализации);
 #   2) описание целиком (в серии c не досчитано из-за нехватки памяти хоста).
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 # shellcheck disable=SC1091
 source scripts/env.sh

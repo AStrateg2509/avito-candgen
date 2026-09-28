@@ -4,7 +4,7 @@
 #   2) состав документа: длиннее параметры / описание, без описания, заголовок ×3;
 #   3) kNN подкатегорий: число соседей и степень веса.
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 # shellcheck disable=SC1091
 source scripts/env.sh

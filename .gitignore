@@ -3,6 +3,7 @@ data/
 artifacts/
 models/
 logs/
+dist/
 .venv/
 answer*.csv
 __pycache__/

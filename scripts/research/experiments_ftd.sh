@@ -4,7 +4,7 @@
 # (finetune --mode val_cold --set finetune.target_model=e5_small_ftd --set finetune.batch_size=64).
 # База: линейное без expansion 0.9031, ранкер s9 0.9154 (холодная валидация).
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 # shellcheck disable=SC1091
 source scripts/env.sh

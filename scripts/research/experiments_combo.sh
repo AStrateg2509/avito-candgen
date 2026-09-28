@@ -3,7 +3,7 @@
 # (e5_small_ftd, вес 0.8) + пул глубиной 200 + канал «ftd без приоров».
 # Порог для сабмита: ≥ 0.9254 (s9 0.9154 + 1.0 п.п.).
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 # shellcheck disable=SC1091
 source scripts/env.sh

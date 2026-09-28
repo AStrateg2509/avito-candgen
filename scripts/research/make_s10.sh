@@ -4,7 +4,7 @@
 # Холодная валидация: 0.9235 против 0.9154 у s9. Нужны модели
 # e5_small_ftd_val_cold (признаки ранкера) и e5_small_ftd_full (бенчмарк).
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 # shellcheck disable=SC1091
 source scripts/env.sh
