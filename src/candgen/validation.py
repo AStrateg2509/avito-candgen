@@ -48,7 +48,10 @@ SEARCH_COLS = ["search_query", "search_location_id", "search_is_delivery_search"
                "search_infm_params_text", "search_category"]
 # Ячейки постстратификации: (срез, есть ли фильтр).
 CELLS = [("seen", True), ("seen", False), ("unseen", True), ("unseen", False)]
-VARIANTS = ("ctx", "ql")
+# ctx — основной; ql — контрольный ключ (запрос, локация); ctx_cold — те же
+# запросы, что ctx, но у релевантных объявлений нет истории в остатке train
+# (см. build_splits): так ведут себя «новые» объявления бенчмарка.
+VARIANTS = ("ctx", "ql", "ctx_cold")
 QID_PREFIX = {"unseen": "vu", "seen": "vs"}
 
 
@@ -294,6 +297,18 @@ def build_splits(cfg: dict, tr: pd.DataFrame | None = None) -> dict:
                                 ("ql", gid_ql, chosen_ql, rest_ql)):
         q, rel = _materialize(tr, gid, ch, rest)
         splits[name] = {"queries": q, "rel": rel, "rest": rest}
+
+    # 6. Вариант ctx_cold («холодные» релевантные). Лидерборд (0.891) оказался
+    #    заметно ниже тёплой валидации (0.938): val-релевантные по построению —
+    #    объявления, которые кликали в train, и у 40% из них есть история в
+    #    остатке (doc expansion, популярность, пары для дообучения). В тесте
+    #    релевантные в основном новые. Поэтому из остатка удаляются ВСЕ строки
+    #    с релевантными объявлениями val-запросов (~1% строк): запросы и
+    #    релевантные те же, что у ctx, но история этих объявлений неизвестна.
+    rel_items = pd.Index(splits["ctx"]["rel"]["item_id"].unique())
+    rest_cold = rest_ctx & ~tr["item_id"].isin(rel_items).to_numpy()
+    q, rel = _materialize(tr, gid_ctx, chosen, rest_cold)
+    splits["ctx_cold"] = {"queries": q, "rel": rel, "rest": rest_cold}
 
     bench = bench_strata(io.load_queries(cfg), tr, vcfg["top_locations_n"])
     splits["meta"] = _to_py({
@@ -624,7 +639,8 @@ def selftest(cfg: dict) -> int:
         r = evaluate(perfect, val, k=max_rel)
         main = [r["bench_adj"], r["weighted"], r["unseen"], r["seen"], r["filter_adj"],
                 r["item_in_rest"], r["item_new"]] + [x["recall"] for x in r["slices"].values()]
-        check(f"[{v}] все релевантные -> 1.0", all(abs(x - 1) < 1e-12 for x in main))
+        # NaN — пустой срез (в ctx_cold нет релевантных из остатка): пропускаем
+        check(f"[{v}] все релевантные -> 1.0", all(abs(x - 1) < 1e-12 for x in main if not math.isnan(x)))
         ceiling = evaluate(perfect, val)["bench_adj"]
         print(f"      потолок bench_adj@{val.k} из-за |rel|>{val.k}: {ceiling:.4f}")
 

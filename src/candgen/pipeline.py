@@ -241,7 +241,7 @@ def main() -> None:
     """CLI валидации: отчёт по текущим весам или абляция по experiments.ablation."""
     parser = argparse.ArgumentParser(description="Пайплайн на валидации")
     parser.add_argument("--config", default="configs/default.yaml")
-    parser.add_argument("--variant", default="ctx", choices=["ctx", "ql"])
+    parser.add_argument("--variant", default="ctx", choices=["ctx", "ql", "ctx_cold"])
     parser.add_argument("--ablation", nargs="?", const="ablation", default=None, metavar="NAME",
                         help="прогнать набор experiments.<NAME> (по умолчанию ablation)")
     parser.add_argument("--set", action="append", default=[], help="правка конфига a.b=значение")

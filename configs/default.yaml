@@ -245,6 +245,10 @@ prerank:
     dense: {e5_small_ft: 1.0, loc: 0.067, mc: 0.012, filter: 0.31}
     expansion: {expansion: 1.0, loc: 0.067, mc: 0.012, filter: 0.31}
   valid_share: 0.2        # доля обучающих запросов фолда под early stopping
+  # Признаки, которые исключаются из ранкера (например, история объявления:
+  # item_pop, expansion, rank_expansion, q_memory_items — они помогают только
+  # объявлениям, встречавшимся в train).
+  drop_features: []
   lgbm:
     objective: lambdarank
     n_estimators: 1000
@@ -406,6 +410,15 @@ experiments:
     - {name: "ф7: e5_small_ft 0.5 вместо user_base", weights: {char: 1.0, word: 0.61, e5_small_ft: 0.5, expansion: 0.39, loc: 0.067, mc: 0.012, filter: 0.31}}
     - {name: "ф7: e5_small_ft без приоров", weights: {e5_small_ft: 1.0}}
     - {name: "user_base без приоров (для сравнения)", weights: {user_base: 1.0}}
+  # Разрыв с лидербордом: одни и те же конфиги на тёплой (ctx) и холодной
+  # (ctx_cold) валидации. Для ctx_cold нужна модель e5_small_ft_val_cold.
+  cold:
+    - {name: "этап 2: char+word+приоры", weights: {char: 1.0, word: 0.52, loc: 0.052, mc: 0.013, filter: 0.74}}
+    - {name: "линейное итоговое (сабмит №3)", weights: &s4lin {char: 1.0, word: 0.61, e5_small_ft: 0.5, expansion: 0.39, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: "− expansion", weights: {char: 1.0, word: 0.61, e5_small_ft: 0.5, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: "expansion 0.15", weights: {char: 1.0, word: 0.61, e5_small_ft: 0.5, expansion: 0.15, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: "− e5_small_ft", weights: {char: 1.0, word: 0.61, expansion: 0.39, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: "e5 1.0, − expansion", weights: {char: 1.0, word: 0.61, e5_small_ft: 1.0, loc: 0.067, mc: 0.012, filter: 0.31}}
   mask:
     - {name: (a) весь корпус, weights: *baseline}
     - {name: (b) P_loc ≥ 0.001, weights: *baseline, loc_mask_min_p: 0.001}

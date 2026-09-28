@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from types import SimpleNamespace
 
 import lightgbm as lgb
 import numpy as np
@@ -53,9 +54,9 @@ FEATURE_DOC = {
 
 
 def channel_weights(cfg: dict) -> dict[str, dict]:
-    """Веса каналов пула ("final" — текущие fusion.weights)."""
+    """Веса каналов пула ("final" — текущие fusion.weights, "skip" — канал выключен)."""
     return {name: (cfg["fusion"]["weights"] if w == "final" else w)
-            for name, w in cfg["prerank"]["channels"].items()}
+            for name, w in cfg["prerank"]["channels"].items() if w != "skip"}
 
 
 def build_pool(scorer: LinearScorer, cfg: dict) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
@@ -210,17 +211,70 @@ def to_cands(top: dict[int, np.ndarray], comp, fallback: np.ndarray, k: int) -> 
     return out
 
 
-def run_val(cfg: dict) -> None:
+def drop_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """Убирает признаки из prerank.drop_features (например, историю объявления)."""
+    return df.drop(columns=cfg["prerank"]["drop_features"], errors="ignore")
+
+
+def val_features(cfg: dict, variant: str) -> SimpleNamespace:
+    """Признаки пула для варианта валидации + всё, что нужно для оценки.
+
+    Скорер и компоненты после расчёта освобождаются (GPU-память нужна
+    следующему варианту). Выход: df (признаки и метки), query_ids, item_ids,
+    lin_idx (линейный top-k для добивки), val (ValSet).
+    """
+    pipe = Pipeline(cfg)
+    queries, train = load_query_set(cfg, "val", variant)
+    comp = pipe.prepare(queries, train)
+    scorer = pipe.scorer(comp)
+    val = load_val(cfg, variant)
+    lin_idx, _ = scorer.topk(cfg["fusion"]["weights"], cfg["fusion"]["k"], cfg["fusion"]["batch_size"])
+    df = drop_features(pool_features(pipe, comp, scorer, queries, train, cfg, val.rel), cfg)
+    out = SimpleNamespace(df=df, query_ids=list(comp.query_ids), item_ids=comp.item_ids, lin_idx=lin_idx, val=val)
+    del scorer, comp
+    torch.cuda.empty_cache()
+    return out
+
+
+def run_transfer(cfg: dict, train_variant: str, eval_variant: str, eval_overrides: list[str]) -> None:
+    """Ранкер учится на признаках одного варианта, оценивается на другом (cross-fitting).
+
+    Нужен для калибровки: например, ранкер по рецепту сабмита №6 (обучен на
+    тёплой валидации) оценивается на холодной — так же, как он применялся к
+    бенчмарку, где у релевантных объявлений обычно нет истории.
+    Запросы у вариантов одни и те же, поэтому половины A/B общие: модель,
+    обученная на половине A одного варианта, предсказывает половину B другого.
+    """
+    tr = val_features(cfg, train_variant)
+    ev = val_features(apply_overrides(cfg, eval_overrides), eval_variant)
+    assert tr.query_ids == ev.query_ids, "у вариантов должны совпадать запросы"
+    half_a, half_b = split_halves(ev.val, cfg["seed"])
+    qpos = {q: i for i, q in enumerate(ev.query_ids)}
+    top = {}
+    for train_ids, test_ids in ((half_a, half_b), (half_b, half_a)):
+        tr_qi = {qpos[q] for q in train_ids}
+        model = fit_ranker(tr.df[tr.df["qi"].isin(tr_qi)], cfg)
+        top.update(top_by_model(model, ev.df[~ev.df["qi"].isin(tr_qi)], cfg["fusion"]["k"]))
+    comp_like = SimpleNamespace(item_ids=ev.item_ids, query_ids=ev.query_ids)
+    res = evaluate(to_cands(top, comp_like, ev.lin_idx, cfg["fusion"]["k"]), ev.val)
+    lin = evaluate({q: ev.item_ids[row].tolist() for q, row in zip(ev.query_ids, ev.lin_idx)}, ev.val)
+    print(f"\nПеренос: ранкер учится на {train_variant}, оценка на {eval_variant}")
+    print(f"Линейное на {eval_variant}: bench_adj {lin['bench_adj']:.4f}")
+    print(f"Ранкер: bench_adj {res['bench_adj']:.4f} (Δ {100 * (res['bench_adj'] - lin['bench_adj']):+.2f} п.п.); "
+          f"новые объявления {res['item_new']:.4f}")
+
+
+def run_val(cfg: dict, variant: str) -> None:
     """Cross-fitting на валидации: 2 фолда по запросам, сравнение с линейным слиянием."""
     t0 = time.time()
     pipe = Pipeline(cfg)
-    queries, train = load_query_set(cfg, "val", "ctx")
+    queries, train = load_query_set(cfg, "val", variant)
     comp = pipe.prepare(queries, train)
     scorer = pipe.scorer(comp)
-    val = load_val(cfg, "ctx")
+    val = load_val(cfg, variant)
     k = cfg["fusion"]["k"]
     lin_idx, _ = scorer.topk(cfg["fusion"]["weights"], k, cfg["fusion"]["batch_size"])
-    df = pool_features(pipe, comp, scorer, queries, train, cfg, val.rel)
+    df = drop_features(pool_features(pipe, comp, scorer, queries, train, cfg, val.rel), cfg)
     print(f"[prerank] признаки: {len(df):,} пар, {len(feature_columns(df))} признаков, "
           f"{time.time() - t0:.0f} с; средний пул {df.groupby('qi').size().mean():.0f}")
     pool_hit = df.groupby("qi")["label"].max()
@@ -247,15 +301,15 @@ def run_val(cfg: dict) -> None:
     print((imp / imp.sum()).head(15).round(4).to_string())
 
 
-def run_bench(cfg: dict) -> None:
+def run_bench(cfg: dict, variant: str) -> None:
     """Ранкер на всех val-запросах -> пул и признаки бенчмарка -> answer.csv (+ проверка)."""
     t0 = time.time()
     pipe = Pipeline(cfg)
-    queries, train = load_query_set(cfg, "val", "ctx")
+    queries, train = load_query_set(cfg, "val", variant)
     comp = pipe.prepare(queries, train)
     scorer = pipe.scorer(comp)
-    val = load_val(cfg, "ctx")
-    df_val = pool_features(pipe, comp, scorer, queries, train, cfg, val.rel)
+    val = load_val(cfg, variant)
+    df_val = drop_features(pool_features(pipe, comp, scorer, queries, train, cfg, val.rel), cfg)
     model = fit_ranker(df_val, cfg)
     print(f"[prerank] ранкер обучен на всех val-запросах: итерация {model.best_iteration_}")
     del scorer, comp, df_val
@@ -268,7 +322,7 @@ def run_bench(cfg: dict) -> None:
     scorer_b = pipe_b.scorer(comp_b)
     k = cfg["fusion"]["k"]
     lin_idx, _ = scorer_b.topk(cfg["fusion"]["weights"], k, cfg["fusion"]["batch_size"])
-    df_b = pool_features(pipe_b, comp_b, scorer_b, queries_b, train_b, bcfg)
+    df_b = drop_features(pool_features(pipe_b, comp_b, scorer_b, queries_b, train_b, bcfg), cfg)
     cands = to_cands(top_by_model(model, df_b, k), comp_b, lin_idx, k)
     path = cfg["paths"]["answer"]
     pd.DataFrame([(q, " ".join(c)) for q, c in cands.items()], columns=["query_id", "answer"]).to_csv(
@@ -281,11 +335,22 @@ def main() -> None:
     """CLI: --mode val (оценка cross-fitting) или --mode bench (answer.csv)."""
     parser = argparse.ArgumentParser(description="LightGBM-предранкер (этап 5)")
     parser.add_argument("--config", default="configs/default.yaml")
-    parser.add_argument("--mode", choices=["val", "bench"], default="val")
+    parser.add_argument("--mode", choices=["val", "bench", "transfer"], default="val")
+    parser.add_argument("--variant", default="ctx", choices=["ctx", "ctx_cold"],
+                        help="на каком варианте валидации учить (и оценивать в режиме val) ранкер")
+    parser.add_argument("--eval-variant", default="ctx_cold", choices=["ctx", "ctx_cold"],
+                        help="режим transfer: вариант, на котором оценивается ранкер")
+    parser.add_argument("--eval-set", action="append", default=[],
+                        help="режим transfer: правки конфига только для оцениваемого варианта")
     parser.add_argument("--set", action="append", default=[], help="правка конфига a.b=значение")
     args = parser.parse_args()
     cfg = apply_overrides(io.load_config(args.config), args.set)
-    run_val(cfg) if args.mode == "val" else run_bench(cfg)
+    if args.mode == "val":
+        run_val(cfg, args.variant)
+    elif args.mode == "bench":
+        run_bench(cfg, args.variant)
+    else:
+        run_transfer(cfg, args.variant, args.eval_variant, args.eval_set)
 
 
 if __name__ == "__main__":

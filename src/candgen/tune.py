@@ -76,7 +76,7 @@ def main() -> None:
     """CLI: подбор на половине A с проверкой на B, затем подбор на всей валидации."""
     parser = argparse.ArgumentParser(description="Подбор весов слияния (Optuna)")
     parser.add_argument("--config", default="configs/default.yaml")
-    parser.add_argument("--variant", default="ctx", choices=["ctx", "ql"])
+    parser.add_argument("--variant", default="ctx", choices=["ctx", "ql", "ctx_cold"])
     parser.add_argument("--trials", type=int, default=None)
     parser.add_argument("--tag", default="", help="суффикс имени reports/tune_<вариант><tag>.json")
     parser.add_argument("--space", default=None, help="именованное пространство из tune.spaces")

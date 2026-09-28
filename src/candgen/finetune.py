@@ -156,7 +156,9 @@ def main() -> None:
     """CLI: пары из остатка (--mode val) или всего train (--mode full) -> дообученная модель."""
     parser = argparse.ArgumentParser(description="Фишка 7: дообучение e5-small")
     parser.add_argument("--config", default="configs/default.yaml")
-    parser.add_argument("--mode", choices=["val", "full"], required=True)
+    # val — остаток train (вариант ctx); val_cold — остаток варианта ctx_cold
+    # (без строк с релевантными объявлениями валидации); full — весь train.
+    parser.add_argument("--mode", choices=["val", "val_cold", "full"], required=True)
     parser.add_argument("--set", action="append", default=[], help="правка конфига a.b=значение")
     args = parser.parse_args()
     cfg = apply_overrides(io.load_config(args.config), args.set)
@@ -164,8 +166,8 @@ def main() -> None:
     device = get_device(cfg)
 
     train = io.load_train(cfg, TRAIN_COLS)
-    if args.mode == "val":
-        train = train[load_train_rest_mask(cfg, "ctx")]
+    if args.mode in ("val", "val_cold"):
+        train = train[load_train_rest_mask(cfg, "ctx" if args.mode == "val" else "ctx_cold")]
     rng = np.random.default_rng(cfg["seed"])
     pairs = build_pairs(train.reset_index(drop=True), rng, cfg["finetune"].get("max_pairs"))
     print(f"[finetune] режим {args.mode}: пар {len(pairs)}, объявлений {len(pairs.attrs['items'])}")
