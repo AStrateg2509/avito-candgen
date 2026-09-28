@@ -147,10 +147,24 @@ dense:
       query_prefix: 'query: '
       doc_prefix: 'passage: '
       max_len: 128
+    # Исследование после лидерборда: e5-small, дообученный на документе с
+    # описанием объявления (свои поля документа и 256 токенов).
+    e5_small_ftd:
+      hf_id: models/finetuned/e5_small_ftd_val_cold
+      query_prefix: 'query: '
+      doc_prefix: 'passage: '
+      max_len: 256
+      doc_fields:
+        - {col: item_title_raw, max_chars: null}
+        - {col: item_infm_params_text, max_chars: 300}
+        - {col: item_description_raw, max_chars: 700}
 
 # Фишка 7: параметры дообучения (1 эпоха MNRL с hard negatives по локации).
 finetune:
   base_model: e5_small
+  # dense-модель, чьи поля документа и max_len используются; модель
+  # сохраняется в <out_dir>/<target_model>_<режим>
+  target_model: e5_small_ft
   batch_size: 128
   lr: 3.0e-5
   warmup_share: 0.05
@@ -230,6 +244,28 @@ fusion:
 submit:
   bench_overrides:
     - dense.models.e5_small_ft.hf_id=models/finetuned/e5_small_ft_full
+    - dense.models.e5_small_ftd.hf_id=models/finetuned/e5_small_ftd_full
+    - crossenc.model_path=models/finetuned/crossenc_full
+
+# Cross-encoder (python -m candgen.crossenc): признаки ce_score / rank_ce / ce_gap
+# в пуле ранкера. Основа — e5-small, вход — «запрос [SEP] объявление».
+crossenc:
+  enabled: false
+  base_model: e5_small            # ключ из dense.models
+  model_path: models/finetuned/crossenc_val_cold   # для сабмита — crossenc_full
+  doc_fields:
+    - {col: item_title_raw, max_chars: null}
+    - {col: item_infm_params_text, max_chars: 200}
+    - {col: item_description_raw, max_chars: 400}
+  max_len: 256
+  batch_queries: 32               # запросов в шаге; пар в шаге = batch_queries × (1 + негативы)
+  n_neg_same: 2                   # негативы той же локации и подкатегории
+  n_neg_mc: 1                     # негативы той же подкатегории
+  lr: 3.0e-5
+  warmup_share: 0.05
+  max_pairs: 200000               # ограничение числа пар обучения (время)
+  infer_batch: 256
+  out_dir: models/finetuned
 
 # ---------------------------------------------------------------- этап 5 ---
 # LightGBM-предранкер (python -m candgen.prerank). Пул кандидатов — объединение
@@ -262,6 +298,9 @@ prerank:
     verbose: -1
   early_stopping_rounds: 50
   eval_at: 50
+  # Итоговый ранкер для бенчмарка: фиксированное число деревьев (среднее
+  # лучших итераций cross-fitting) вместо раннего останова. null — ранний останов.
+  final_n_estimators: null
 
 # Подбор весов (python -m candgen.tune): [низ, верх, шкала]; char = 1 — масштаб.
 # Этап 3: добавлены dense (e5_base, user_base) и doc expansion; память не
@@ -419,6 +458,15 @@ experiments:
     - {name: "expansion 0.15", weights: {char: 1.0, word: 0.61, e5_small_ft: 0.5, expansion: 0.15, loc: 0.067, mc: 0.012, filter: 0.31}}
     - {name: "− e5_small_ft", weights: {char: 1.0, word: 0.61, expansion: 0.39, loc: 0.067, mc: 0.012, filter: 0.31}}
     - {name: "e5 1.0, − expansion", weights: {char: 1.0, word: 0.61, e5_small_ft: 1.0, loc: 0.067, mc: 0.012, filter: 0.31}}
+  # Исследование: dense на документе с описанием (e5_small_ftd) против
+  # прежнего (e5_small_ft); оба на холодной валидации, без expansion.
+  ftd:
+    - {name: "e5_small_ft без приоров", weights: {e5_small_ft: 1.0}}
+    - {name: "e5_small_ftd без приоров", weights: {e5_small_ftd: 1.0}}
+    - {name: "линейное (e5_small_ft 0.5)", weights: {char: 1.0, word: 0.61, e5_small_ft: 0.5, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: "линейное (e5_small_ftd 0.5)", weights: {char: 1.0, word: 0.61, e5_small_ftd: 0.5, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: "линейное (e5_small_ftd 0.8)", weights: {char: 1.0, word: 0.61, e5_small_ftd: 0.8, loc: 0.067, mc: 0.012, filter: 0.31}}
+    - {name: "линейное (оба dense по 0.3)", weights: {char: 1.0, word: 0.61, e5_small_ft: 0.3, e5_small_ftd: 0.3, loc: 0.067, mc: 0.012, filter: 0.31}}
   mask:
     - {name: (a) весь корпус, weights: *baseline}
     - {name: (b) P_loc ≥ 0.001, weights: *baseline, loc_mask_min_p: 0.001}

@@ -24,7 +24,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import lightgbm as lgb
@@ -33,8 +35,12 @@ import pandas as pd
 import torch
 
 from candgen import io
+from candgen.crossenc import score_pairs
 from candgen.fusion import LinearScorer
+from candgen.text import build_raw_doc_texts
 from candgen.pipeline import Pipeline, apply_overrides, load_query_set
+from candgen.retrievers.dense import _local_model_stamp
+from candgen.torch_utils import get_device
 from candgen.submit import K_MAX, validate
 from candgen.validation import ValSet, evaluate, format_report, load_val, split_halves
 
@@ -170,34 +176,98 @@ def pool_features(pipe: Pipeline, comp, scorer: LinearScorer, queries: pd.DataFr
     return df
 
 
+def add_ce_features(df: pd.DataFrame, cfg: dict, queries: pd.DataFrame, pipe: Pipeline) -> pd.DataFrame:
+    """Признаки cross-encoder (ce_score, rank_ce, ce_gap), если crossenc.enabled.
+
+    Вызывается ПОСЛЕ освобождения скорера: его матрицы занимают ~6 ГБ видеопамяти,
+    и вместе с cross-encoder'ом (батч 512 × 256 токенов) память переполнялась,
+    а инференс замедлялся в разы.
+    """
+    if not cfg["crossenc"]["enabled"]:
+        return df
+    q_raw = queries["search_query"].fillna("").astype(str).tolist()
+    df["ce_score"] = cached_ce_scores(cfg, df, q_raw, pipe, get_device(cfg))
+    df["rank_ce"] = df.groupby("qi")["ce_score"].rank(ascending=False, method="first").astype(np.float32)
+    df["ce_gap"] = df["ce_score"] - df.groupby("qi")["ce_score"].transform("max")
+    return df
+
+
+def cached_ce_scores(cfg: dict, df: pd.DataFrame, q_raw: list[str], pipe: Pipeline,
+                     device: torch.device) -> np.ndarray:
+    """Скоры cross-encoder для пар пула с кэшем на диске (artifacts/ce_cache).
+
+    Инференс по пулу валидации — ~17 мин, а эксперименты с ранкером повторяют
+    одни и те же пары. Ключ — модель (путь и время изменения весов), пары
+    (запрос, объявление) и тексты запросов, поэтому устаревший кэш не подхватится.
+    """
+    ccfg = cfg["crossenc"]
+    stamp = (ccfg["model_path"] + _local_model_stamp({"hf_id": ccfg["model_path"]})
+             + repr((ccfg["max_len"], ccfg["doc_fields"])))
+    h = hashlib.sha1(stamp.encode())
+    h.update(pd.util.hash_pandas_object(df[["qi", "item"]], index=False).to_numpy().tobytes())
+    h.update("\n".join(q_raw).encode("utf-8"))
+    path = Path(cfg["paths"]["artifacts_dir"]) / "ce_cache" / f"{h.hexdigest()[:16]}.npy"
+    if path.exists():
+        return np.load(path)
+    d_raw = build_raw_doc_texts(pipe.items, cfg["crossenc"]["doc_fields"])
+    scores = score_pairs(cfg, [q_raw[i] for i in df["qi"].to_numpy()],
+                         [d_raw[j] for j in df["item"].to_numpy()], device)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(path, scores)
+    return scores
+
+
 def feature_columns(df: pd.DataFrame) -> list[str]:
     """Все столбцы-признаки (без служебных qi, item, label)."""
     return [c for c in df.columns if c not in ("qi", "item", "label")]
 
 
-def fit_ranker(df: pd.DataFrame, cfg: dict) -> lgb.LGBMRanker:
-    """Обучает LGBMRanker с early stopping на отложенной части обучающих запросов.
+def fit_ranker(df: pd.DataFrame, cfg: dict, n_estimators: int | None = None) -> lgb.LGBMModel:
+    """Обучает ранкер с early stopping на отложенной части обучающих запросов.
 
-    Запросы без положительных в пуле не дают сигнала lambdarank и отбрасываются.
+    objective: lambdarank — LGBMRanker (группа = запрос); binary — LGBMClassifier
+    (Recall@50 — это попадание в top-50, а не порядок внутри него).
+    Запросы без положительных в пуле не дают сигнала и отбрасываются.
+    Если задан n_estimators, early stopping не используется: модель учится на
+    всех запросах ровно с этим числом деревьев. Так обучается итоговый ранкер
+    для бенчмарка — с числом деревьев из cross-fitting, а не по шумной
+    случайной отложенной выборке (у запроса обычно одно релевантное, и
+    NDCG@50 на 20% запросов скачет: был останов на 17-й итерации при 150 в фолдах).
     """
     pcfg = cfg["prerank"]
     feats = feature_columns(df)
     df = df[df.groupby("qi")["label"].transform("max") > 0]
+    if n_estimators:
+        params = {**pcfg["lgbm"], "n_estimators": n_estimators}
+        if params["objective"] == "binary":
+            model = lgb.LGBMClassifier(**params, random_state=cfg["seed"], n_jobs=cfg["n_jobs"])
+            model.fit(df[feats], df["label"])
+        else:
+            model = lgb.LGBMRanker(**params, random_state=cfg["seed"], n_jobs=cfg["n_jobs"])
+            model.fit(df[feats], df["label"], group=df.groupby("qi", sort=True).size().to_numpy())
+        return model
     qids = np.sort(df["qi"].unique())
     rng = np.random.default_rng(cfg["seed"])
     va_q = set(rng.choice(qids, size=int(len(qids) * pcfg["valid_share"]), replace=False))
     is_va = df["qi"].isin(va_q).to_numpy()
     tr, va = df[~is_va], df[is_va]
+    stop = [lgb.early_stopping(pcfg["early_stopping_rounds"], verbose=False)]
+    if pcfg["lgbm"]["objective"] == "binary":
+        model = lgb.LGBMClassifier(**pcfg["lgbm"], random_state=cfg["seed"], n_jobs=cfg["n_jobs"])
+        model.fit(tr[feats], tr["label"], eval_set=[(va[feats], va["label"])], callbacks=stop)
+        return model
     model = lgb.LGBMRanker(**pcfg["lgbm"], random_state=cfg["seed"], n_jobs=cfg["n_jobs"])
     model.fit(tr[feats], tr["label"], group=tr.groupby("qi", sort=True).size().to_numpy(),
               eval_set=[(va[feats], va["label"])], eval_group=[va.groupby("qi", sort=True).size().to_numpy()],
-              eval_at=[pcfg["eval_at"]], callbacks=[lgb.early_stopping(pcfg["early_stopping_rounds"], verbose=False)])
+              eval_at=[pcfg["eval_at"]], callbacks=stop)
     return model
 
 
-def top_by_model(model: lgb.LGBMRanker, df: pd.DataFrame, k: int) -> dict[int, np.ndarray]:
+def top_by_model(model: lgb.LGBMModel, df: pd.DataFrame, k: int) -> dict[int, np.ndarray]:
     """top-k индексов объявлений каждого запроса по предсказанию модели."""
-    df = df.assign(pred=model.predict(df[feature_columns(df.drop(columns=["label"], errors="ignore"))]))
+    X = df[feature_columns(df.drop(columns=["label"], errors="ignore"))]
+    pred = model.predict_proba(X)[:, 1] if isinstance(model, lgb.LGBMClassifier) else model.predict(X)
+    df = df.assign(pred=pred)
     df = df.sort_values(["qi", "pred"], ascending=[True, False], kind="mergesort")
     return {qi: g["item"].to_numpy()[:k] for qi, g in df.groupby("qi", sort=False)}
 
@@ -229,10 +299,11 @@ def val_features(cfg: dict, variant: str) -> SimpleNamespace:
     scorer = pipe.scorer(comp)
     val = load_val(cfg, variant)
     lin_idx, _ = scorer.topk(cfg["fusion"]["weights"], cfg["fusion"]["k"], cfg["fusion"]["batch_size"])
-    df = drop_features(pool_features(pipe, comp, scorer, queries, train, cfg, val.rel), cfg)
-    out = SimpleNamespace(df=df, query_ids=list(comp.query_ids), item_ids=comp.item_ids, lin_idx=lin_idx, val=val)
+    df = pool_features(pipe, comp, scorer, queries, train, cfg, val.rel)
+    out = SimpleNamespace(query_ids=list(comp.query_ids), item_ids=comp.item_ids, lin_idx=lin_idx, val=val)
     del scorer, comp
     torch.cuda.empty_cache()
+    out.df = drop_features(add_ce_features(df, cfg, queries, pipe), cfg)
     return out
 
 
@@ -267,21 +338,15 @@ def run_transfer(cfg: dict, train_variant: str, eval_variant: str, eval_override
 def run_val(cfg: dict, variant: str) -> None:
     """Cross-fitting на валидации: 2 фолда по запросам, сравнение с линейным слиянием."""
     t0 = time.time()
-    pipe = Pipeline(cfg)
-    queries, train = load_query_set(cfg, "val", variant)
-    comp = pipe.prepare(queries, train)
-    scorer = pipe.scorer(comp)
-    val = load_val(cfg, variant)
-    k = cfg["fusion"]["k"]
-    lin_idx, _ = scorer.topk(cfg["fusion"]["weights"], k, cfg["fusion"]["batch_size"])
-    df = drop_features(pool_features(pipe, comp, scorer, queries, train, cfg, val.rel), cfg)
+    fv = val_features(cfg, variant)
+    df, val, k = fv.df, fv.val, cfg["fusion"]["k"]
     print(f"[prerank] признаки: {len(df):,} пар, {len(feature_columns(df))} признаков, "
           f"{time.time() - t0:.0f} с; средний пул {df.groupby('qi').size().mean():.0f}")
     pool_hit = df.groupby("qi")["label"].max()
     print(f"[prerank] доля запросов с релевантным в пуле: {pool_hit.mean():.4f}")
 
     half_a, half_b = split_halves(val, cfg["seed"])
-    qpos = {q: i for i, q in enumerate(comp.query_ids)}
+    qpos = {q: i for i, q in enumerate(fv.query_ids)}
     top, importances = {}, []
     for train_ids, test_ids in ((half_a, half_b), (half_b, half_a)):
         tr_qi = {qpos[q] for q in train_ids}
@@ -290,8 +355,9 @@ def run_val(cfg: dict, variant: str) -> None:
         top.update(top_by_model(model, df[~df["qi"].isin(tr_qi)], k))
         importances.append(pd.Series(model.booster_.feature_importance("gain"),
                                      index=feature_columns(df)))
-    res_rank = evaluate(to_cands(top, comp, lin_idx, k), val)
-    res_lin = evaluate(scorer.to_candidates(lin_idx), val)
+    comp_like = SimpleNamespace(item_ids=fv.item_ids, query_ids=fv.query_ids)
+    res_rank = evaluate(to_cands(top, comp_like, fv.lin_idx, k), val)
+    res_lin = evaluate({q: fv.item_ids[row].tolist() for q, row in zip(fv.query_ids, fv.lin_idx)}, val)
     print(f"\nЛинейное слияние: bench_adj {res_lin['bench_adj']:.4f}")
     print(f"LightGBM-предранкер (cross-fitting): bench_adj {res_rank['bench_adj']:.4f} "
           f"(Δ {100 * (res_rank['bench_adj'] - res_lin['bench_adj']):+.2f} п.п.)\n")
@@ -304,16 +370,12 @@ def run_val(cfg: dict, variant: str) -> None:
 def run_bench(cfg: dict, variant: str) -> None:
     """Ранкер на всех val-запросах -> пул и признаки бенчмарка -> answer.csv (+ проверка)."""
     t0 = time.time()
-    pipe = Pipeline(cfg)
-    queries, train = load_query_set(cfg, "val", variant)
-    comp = pipe.prepare(queries, train)
-    scorer = pipe.scorer(comp)
-    val = load_val(cfg, variant)
-    df_val = drop_features(pool_features(pipe, comp, scorer, queries, train, cfg, val.rel), cfg)
-    model = fit_ranker(df_val, cfg)
-    print(f"[prerank] ранкер обучен на всех val-запросах: итерация {model.best_iteration_}")
-    del scorer, comp, df_val
-    torch.cuda.empty_cache()
+    fv = val_features(cfg, variant)
+    n_final = cfg["prerank"].get("final_n_estimators")
+    model = fit_ranker(fv.df, cfg, n_final)
+    print(f"[prerank] ранкер обучен на всех val-запросах: "
+          + (f"фиксировано {n_final} деревьев" if n_final else f"итерация {model.best_iteration_}"))
+    del fv
 
     bcfg = apply_overrides(cfg, cfg["submit"]["bench_overrides"])
     pipe_b = Pipeline(bcfg)
@@ -322,7 +384,10 @@ def run_bench(cfg: dict, variant: str) -> None:
     scorer_b = pipe_b.scorer(comp_b)
     k = cfg["fusion"]["k"]
     lin_idx, _ = scorer_b.topk(cfg["fusion"]["weights"], k, cfg["fusion"]["batch_size"])
-    df_b = drop_features(pool_features(pipe_b, comp_b, scorer_b, queries_b, train_b, bcfg), cfg)
+    df_b = pool_features(pipe_b, comp_b, scorer_b, queries_b, train_b, bcfg)
+    del scorer_b  # освобождаем видеопамять перед cross-encoder
+    torch.cuda.empty_cache()
+    df_b = drop_features(add_ce_features(df_b, bcfg, queries_b, pipe_b), cfg)
     cands = to_cands(top_by_model(model, df_b, k), comp_b, lin_idx, k)
     path = cfg["paths"]["answer"]
     pd.DataFrame([(q, " ".join(c)) for q, c in cands.items()], columns=["query_id", "answer"]).to_csv(

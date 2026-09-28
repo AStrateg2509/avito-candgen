@@ -28,6 +28,7 @@ import torch.nn.functional as F
 
 from candgen import io
 from candgen.pipeline import apply_overrides
+from candgen.retrievers.dense import doc_fields_for
 from candgen.text import build_raw_doc_texts, normalize_series
 from candgen.torch_utils import get_device
 from candgen.validation import load_train_rest_mask
@@ -45,8 +46,9 @@ def build_pairs(train: pd.DataFrame, rng: np.random.Generator, max_pairs: int | 
     """
     train = train.assign(query_norm=normalize_series(train["search_query"]))
     train = train[train["query_norm"] != ""]
-    items = (train.drop_duplicates("item_id")[["item_id", "item_location_id", "item_microcat_id",
-                                               "item_title_raw", "item_infm_params_text"]]
+    # все загруженные поля объявления (cross-encoder дополнительно берёт описание)
+    item_cols = [c for c in train.columns if c.startswith("item_")]
+    items = (train.drop_duplicates("item_id")[item_cols]
              .sort_values("item_id").reset_index(drop=True))
     ipos = pd.Series(np.arange(len(items)), index=items["item_id"])
     # Одна пара на (нормализованный запрос, объявление); текст запроса — первый сырой вариант.
@@ -93,10 +95,14 @@ def train_model(cfg: dict, pairs: pd.DataFrame, out_dir: Path, device: torch.dev
 
     fcfg = cfg["finetune"]
     base = cfg["dense"]["models"][fcfg["base_model"]]
+    # поля и длина документа — как у целевой dense-модели (например, с описанием)
+    target = cfg["dense"]["models"][fcfg["target_model"]]
+    doc_max_len = target["max_len"]
     model = SentenceTransformer(base["hf_id"], device=str(device))
-    model.max_seq_length = base["max_len"]
+    model.max_seq_length = doc_max_len
     items = pairs.attrs["items"]
-    doc_texts = np.array([base["doc_prefix"] + t for t in build_raw_doc_texts(items, cfg["dense"]["doc_fields"])],
+    doc_texts = np.array([base["doc_prefix"] + t
+                          for t in build_raw_doc_texts(items, doc_fields_for(cfg, fcfg["target_model"]))],
                          dtype=object)
     q_texts = (base["query_prefix"] + pairs["search_query"].astype(str)).to_numpy()
 
@@ -130,7 +136,7 @@ def train_model(cfg: dict, pairs: pd.DataFrame, out_dir: Path, device: torch.dev
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
             q = embed(q_texts[b].tolist(), fcfg["query_max_len"])
             d = embed(doc_texts[np.concatenate([pairs["pos"].to_numpy()[b], pairs["neg"].to_numpy()[b]])].tolist(),
-                      base["max_len"])
+                      doc_max_len)
             # строки — запросы; столбцы — все позитивы и hard negatives батча;
             # правильный ответ для запроса i — его позитив (столбец i)
             logits = (q @ d.T).float() * fcfg["scale"]
@@ -165,13 +171,17 @@ def main() -> None:
     torch.manual_seed(cfg["seed"])
     device = get_device(cfg)
 
-    train = io.load_train(cfg, TRAIN_COLS)
+    target = cfg["finetune"]["target_model"]
+    # дополнительные поля документа целевой модели (например, описание) грузим из train
+    extra = [f["col"] for f in doc_fields_for(cfg, target) if f["col"] not in TRAIN_COLS]
+    train = io.load_train(cfg, TRAIN_COLS + extra)
     if args.mode in ("val", "val_cold"):
         train = train[load_train_rest_mask(cfg, "ctx" if args.mode == "val" else "ctx_cold")]
     rng = np.random.default_rng(cfg["seed"])
     pairs = build_pairs(train.reset_index(drop=True), rng, cfg["finetune"].get("max_pairs"))
-    print(f"[finetune] режим {args.mode}: пар {len(pairs)}, объявлений {len(pairs.attrs['items'])}")
-    out_dir = Path(cfg["finetune"]["out_dir"]) / f"e5_small_ft_{args.mode}"
+    print(f"[finetune] режим {args.mode}: пар {len(pairs)}, объявлений {len(pairs.attrs['items'])}, "
+          f"целевая модель {target}")
+    out_dir = Path(cfg["finetune"]["out_dir"]) / f"{target}_{args.mode}"
     stats = train_model(cfg, pairs, out_dir, device)
     print(f"[finetune] готово: {stats} -> {out_dir}")
 

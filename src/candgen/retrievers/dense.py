@@ -80,6 +80,11 @@ class DenseModel:
             torch.cuda.empty_cache()
 
 
+def doc_fields_for(cfg: dict, name: str) -> list[dict]:
+    """Поля dense-документа модели: свои (models.<имя>.doc_fields) или общие dense.doc_fields."""
+    return cfg["dense"]["models"][name].get("doc_fields", cfg["dense"]["doc_fields"])
+
+
 def _local_model_stamp(mcfg: dict) -> str:
     """Для локальной (дообученной) модели — время изменения её весов, иначе "".
 
@@ -113,7 +118,7 @@ def train_item_embeddings(cfg: dict, name: str, model: DenseModel, train_items: 
     if path.exists():
         return np.load(path)
     t0 = time.time()
-    emb = model.encode_docs(build_raw_doc_texts(train_items, dcfg["doc_fields"]))
+    emb = model.encode_docs(build_raw_doc_texts(train_items, doc_fields_for(cfg, name)))
     path.parent.mkdir(parents=True, exist_ok=True)
     np.save(path, emb)
     print(f"[dense] {name}: объявления train ({len(train_items)}) закодированы за {time.time() - t0:.0f} с -> {path}")
@@ -139,7 +144,7 @@ def item_embeddings(cfg: dict, name: str, model: DenseModel, items: pd.DataFrame
     if path.exists():
         return np.load(path)
     t0 = time.time()
-    emb = model.encode_docs(build_raw_doc_texts(items, dcfg["doc_fields"]))
+    emb = model.encode_docs(build_raw_doc_texts(items, doc_fields_for(cfg, name)))
     path.parent.mkdir(parents=True, exist_ok=True)
     np.save(path, emb)
     dt = time.time() - t0
