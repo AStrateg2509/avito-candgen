@@ -114,7 +114,7 @@ lexical:
 dense:
   # Какие модели участвуют в скоринге (имена из models). e5_base проверен на
   # этапе 3: поверх USER-base даёт 0.12 п.п. (< 0.3) — выключен. Этап 4:
-  # дообученная e5-small (фишка 7) вместо USER-base: +0.82 п.п. Итог (s10,
+  # дообученная e5-small (дообучение на кликах) вместо USER-base: +0.82 п.п. Итог (s10,
   # LB 0.8963): e5-small, дообученная на тексте с описанием объявления.
   active: [e5_small_ftd]
   batch_size: 256
@@ -140,7 +140,7 @@ dense:
       query_prefix: 'query: '
       doc_prefix: 'passage: '
       max_len: 128
-    # Фишка 7: e5-small, дообученный на train (python -m candgen.finetune).
+    # e5-small, дообученный на кликах train (python -m candgen.finetune).
     # На валидации — модель, обученная на остатке (_val); для сабмита путь
     # переопределяется на _full (см. scripts/run_all.sh).
     e5_small_ft:
@@ -160,7 +160,7 @@ dense:
         - {col: item_infm_params_text, max_chars: 300}
         - {col: item_description_raw, max_chars: 700}
 
-# Фишка 7: параметры дообучения (1 эпоха MNRL с hard negatives по локации).
+# Параметры дообучения e5-small (1 эпоха MNRL с hard negatives по локации).
 finetune:
   base_model: e5_small
   # dense-модель, чьи поля документа и max_len используются; модель
@@ -186,7 +186,7 @@ memory:
     n_features: 4194304
     lemmatize: false
 
-# Фишка 4 (этап 4): перенос запросов train на похожие объявления корпуса.
+# Перенос запросов train на похожие объявления корпуса.
 # Соседи — объявления train той же подкатегории по dense-эмбеддингу модели
 # model с косинусом ≥ min_sim; вес источника — gexp в fusion.weights.
 # Проверено: и мягкий (k=5, 0.85), и строгий (k=3, 0.92) варианты не дают
@@ -206,19 +206,19 @@ graph_expansion:
 
 priors:
   loc:
-    eps: 3.0e-6           # score += α·log(P(item_loc | search_loc) + eps); подобрано (ТЗ: 1e-4)
+    eps: 3.0e-6           # score += α·log(P(item_loc | search_loc) + eps); подобрано (исходно 1e-4)
     fallback: self        # локации поиска нет в train: self — P=1 своей, uniform — равномерно
-    # Фишка 2: гео-сглаживание P = (C + λ·K)/(N + λ), K ∝ n_items·exp(−км/σ); λ = 0 — выкл.
+    # Гео-сглаживание P = (C + λ·K)/(N + λ), K ∝ n_items·exp(−км/σ); λ = 0 — выкл.
     smooth_lambda: 0.0
     sigma_km: 30.0
-    # Фишка 6: локация поиска — «агрегат» (регион), если доля кликов в неё саму
+    # Регион или город: локация поиска — «агрегат» (регион), если доля кликов в неё саму
     # меньше порога (у городов > 0.6, у регионов ≈ 0 — распределение бимодально).
     agg_self_share_max: 0.5
   mc:
     k: 20                 # соседей среди текстов train (char 2–4 TF-IDF)
     ngram_range: [2, 4]
     power: 1.0            # вес соседа = sim**power
-    eps: 8.6e-4           # score += β·log(P_mc + eps); подобрано (ТЗ: 1e-3)
+    eps: 8.6e-4           # score += β·log(P_mc + eps); подобрано (исходно 1e-3)
   filter:
     match: pair           # pair: «ключ значение» ⊂ параметров; value: только значение
     key_weights: {Вид услуги: 0.5, Тип услуги: 0.5}
@@ -230,7 +230,7 @@ fusion:
   # Этап 3: подобраны Optuna на всей валидации (reports/tune_ctx.json, 60+60
   # trials); на отложенной половине B подбор дал +1.85 п.п. bench_adj.
   # Этап 2: {char 1, word 0.52, loc 0.052, mc 0.013, filter 0.74}, eps 3e-5 / 1.3e-3.
-  # Baseline ТЗ: {char 1, loc 0.05, mc 0.03, filter 0.2}, eps 1e-4 / 1e-3.
+  # Простая база: {char 1, loc 0.05, mc 0.03, filter 0.2}, eps 1e-4 / 1e-3.
   # e5_base выключен: без него −0.12 п.п. (< 0.3) — одна dense-модель проще.
   # Этап 4: user_base заменён дообученной e5_small_ft (стартовые веса до переподбора).
   # Итог (s10): dense — e5_small_ftd (текст с описанием); doc expansion выключен —
@@ -331,7 +331,7 @@ tune:
     mc_eps: [1.0e-5, 1.0e-1, log]
   # Именованные пространства (python -m candgen.tune --space <имя>).
   spaces:
-    # Фишки 2 + 6: гео-сглаживание и отдельные веса для регионов-агрегатов
+    # Гео-сглаживание и отдельные веса для регионов-агрегатов
     # (веса для городов — из fusion.weights, не меняются).
     feat26:
       loc_lambda: [0.0, 20.0, uniform]
@@ -425,7 +425,7 @@ experiments:
       channels:
         linear: {n: 40, weights: *stage3}
         dense: {n: 10, weights: {e5_base: 1.28, user_base: 0.44, loc: 0.067, mc: 0.012, filter: 0.31}}
-  # Этап 4, фишки 2 (гео-сглаживание P_loc) и 6 (свой вес для регионов-агрегатов).
+  # Гео-сглаживание P_loc и свой вес для регионов-агрегатов.
   feat26:
     - {name: итог этапа 3, weights: &s3fin {char: 1.0, word: 0.61, user_base: 0.22, expansion: 0.39, loc: 0.067, mc: 0.012, filter: 0.31}}
     - {name: "ф2: λ=1 σ=10", weights: *s3fin, params: {loc_lambda: 1.0, loc_sigma: 10.0}}
@@ -441,7 +441,7 @@ experiments:
     - {name: "ф6: loc_agg=0.04", weights: {char: 1.0, word: 0.61, user_base: 0.22, expansion: 0.39, loc: 0.067, loc_agg: 0.04, mc: 0.012, filter: 0.31}}
     - {name: "ф6: loc_agg=0.1", weights: {char: 1.0, word: 0.61, user_base: 0.22, expansion: 0.39, loc: 0.067, loc_agg: 0.1, mc: 0.012, filter: 0.31}}
     - {name: "ф6: loc_agg=0.15", weights: {char: 1.0, word: 0.61, user_base: 0.22, expansion: 0.39, loc: 0.067, loc_agg: 0.15, mc: 0.012, filter: 0.31}}
-  # Этап 4, фишка 4: перенос запросов на похожие объявления (источник gexp).
+  # Перенос запросов на похожие объявления (источник gexp).
   feat4:
     - {name: итог этапа 3, weights: *s3fin}
     - {name: "ф4: + gexp 0.1", weights: {char: 1.0, word: 0.61, user_base: 0.22, expansion: 0.39, gexp: 0.1, loc: 0.067, mc: 0.012, filter: 0.31}}
@@ -453,7 +453,7 @@ experiments:
     - {name: итог этапа 3, weights: *s3fin}
     - {name: "ф4 строгий: + gexp 0.1", weights: {char: 1.0, word: 0.61, user_base: 0.22, expansion: 0.39, gexp: 0.1, loc: 0.067, mc: 0.012, filter: 0.31}}
     - {name: "ф4 строгий: + gexp 0.2", weights: {char: 1.0, word: 0.61, user_base: 0.22, expansion: 0.39, gexp: 0.2, loc: 0.067, mc: 0.012, filter: 0.31}}
-  # Фишка 7 (нужен dense.active: [user_base, e5_small_ft] и graph_expansion.enabled: false).
+  # Дообученная e5-small (нужен dense.active: [user_base, e5_small_ft] и graph_expansion.enabled: false).
   feat7:
     - {name: итог этапа 3, weights: *s3fin}
     - {name: "ф7: + e5_small_ft 0.2", weights: {char: 1.0, word: 0.61, user_base: 0.22, e5_small_ft: 0.2, expansion: 0.39, loc: 0.067, mc: 0.012, filter: 0.31}}

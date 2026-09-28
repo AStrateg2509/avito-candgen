@@ -1,4 +1,4 @@
-"""EDA: перепроверка фактов из ТЗ, проверки для валидации, графики.
+"""EDA: перепроверка исходных фактов о данных, проверки для валидации, графики.
 
 Запуск: `python -m candgen.eda [--config configs/default.yaml]`.
 Результат: reports/eda.md и картинки reports/fig/*.png (открываются в VS Code).
@@ -45,7 +45,7 @@ EXPECTED_CELLS = {"seen_filter": 0.209, "seen_nofilter": 0.161,
 
 @dataclass
 class Fact:
-    """Одна строка таблицы фактов: что ожидали по ТЗ и что получили.
+    """Одна строка таблицы фактов: что ожидали и что получили.
 
     ok — значение в пределах допуска tol (абсолютного для долей,
     относительного для счётчиков — см. rel_tol).
@@ -107,7 +107,7 @@ def filter_stats(tr: pd.DataFrame, q: pd.DataFrame, cfg: dict) -> dict:
 
     Разбор делается по уникальным строкам фильтра (их ~3,7 тыс.), а не по
     0,5 млн строк train. Совпадение считается двумя способами: значение как
-    подстрока параметров объявления (как в ТЗ) и пара «ключ значение» как
+    подстрока параметров объявления (мягкий вариант) и пара «ключ значение» как
     подстрока (строже).
 
     Вход: train (с item_infm_params_text), бенчмарк, конфиг.
@@ -150,7 +150,7 @@ def filter_stats(tr: pd.DataFrame, q: pd.DataFrame, cfg: dict) -> dict:
 
 
 def compute(data: dict, cfg: dict) -> dict:
-    """Считает все числа отчёта (факты ТЗ, проверки, данные для графиков).
+    """Считает все числа отчёта (исходные факты, проверки, данные для графиков).
 
     Вход: результат load_data, конфиг.
     Выход: словарь R с именованными величинами; ключ facts — список Fact.
@@ -243,7 +243,7 @@ def compute(data: dict, cfg: dict) -> dict:
     R["top_locs"] = pd.DataFrame({"bench": loc_q.loc[top_locs],
                                   "corpus": loc_c.reindex(top_locs).fillna(0)})
     # Локации из топа бенчмарка, где в корпусе нет ни одного объявления
-    # (кандидаты в «агрегаты» — регион/страна, см. фишку 6 в PLAN.md).
+    # (кандидаты в «агрегаты» — регион/страна).
     absent = R["top_locs"].index[R["top_locs"]["corpus"] == 0]
     R["top_locs_absent"] = [int(x) for x in absent]
     R["top_locs_absent_share"] = float(loc_q.loc[absent].sum())
@@ -273,10 +273,10 @@ def compute(data: dict, cfg: dict) -> dict:
         Fact("Запросов бенчмарка, дословно встречавшихся в train", 907, R["bench_seen_exact"],
              "{:,.0f}", 0.01, True, f"после нормализации: {R['bench_seen_norm']:,}"),
         Fact("…из них с выбранными в train объявлениями корпуса", 360, R["bench_mem_exact"],
-             "{:,.0f}", 0.02, True, f"с той же локацией: {R['bench_mem_exact_same_loc']} (ТЗ: 91)"),
+             "{:,.0f}", 0.02, True, f"с той же локацией: {R['bench_mem_exact_same_loc']} (ожидалось: 91)"),
         Fact("Объявлений корпуса, встречающихся в train", 18142, R["corpus_in_train"], "{:,.0f}", 0.01, True),
         Fact("Доля item_category_id = 114 в корпусе", 0.99, R["share_cat114"], "{:.3f}", 0.01,
-             note=f"подкатегорий в корпусе: {R['n_microcat_corpus']} (ТЗ: 752)"),
+             note=f"подкатегорий в корпусе: {R['n_microcat_corpus']} (ожидалось: 752)"),
         Fact("Доля search_category = 0 в бенчмарке", 0.09, R["bench_cat0"], "{:.3f}", 0.01,
              note=f"в train таких строк всего {R['train_cat0_rows']}"),
         Fact("Совпадение локации поиска и объявления (строки train)", 0.83, R["loc_match_rows"], "{:.3f}", 0.01),
@@ -473,11 +473,11 @@ def write_report(R: dict, figs: dict[str, str], path: Path, cfg: dict) -> None:
          f"Сгенерировано `python -m candgen.eda` {dt.date.today().isoformat()}. "
          "Все числа пересчитываются из `data/raw` при каждом запуске.",
          "",
-         "## 1. Факты из ТЗ: перепроверка",
+         "## 1. Исходные факты о данных: перепроверка",
          "",
          "✓ — совпало в пределах допуска; ≠ — расхождение (см. комментарий).",
          "",
-         "| № | факт | ТЗ | получено | | комментарий |",
+         "| № | факт | ожидалось | получено | | комментарий |",
          "|---|---|---|---|---|---|"]
     for i, f in enumerate(R["facts"], 1):
         L.append(f"| {i} | {f.name} | {f.fmt.format(f.expected)} | {f.fmt.format(f.got)} | "
@@ -518,7 +518,7 @@ def write_report(R: dict, figs: dict[str, str], path: Path, cfg: dict) -> None:
           f"на них {_pct(R['ql_multi_ctx_rows_share'])} строк train. Поэтому ключ «полный контекст» "
           "и ключ «(запрос, локация)» различаются, и контрольный вариант `ql` нужен.",
           f"- **Выбранных объявлений на группу** (запрос, локация) — все объявления: "
-          f"{R['items_per_group_raw']:.2f} (ТЗ: 1,47). Только объявления корпуса: полный контекст — "
+          f"{R['items_per_group_raw']:.2f} (ожидалось: 1,47). Только объявления корпуса: полный контекст — "
           f"{R['rel_ctx']['mean']:.3f} (ровно одно у {_pct(R['rel_ctx']['share_1'])} групп), "
           f"(запрос, локация) — {R['rel_ql']['mean']:.3f} (ровно одно у {_pct(R['rel_ql']['share_1'])}). "
           "Recall запроса почти всегда 0 или 1.",
@@ -627,7 +627,7 @@ def main() -> None:
 
     print(f"Готово: {reports / 'eda.md'}")
     for f in R["facts"]:
-        print(f"{'OK ' if f.ok else 'DIFF'} {f.name}: ТЗ {f.fmt.format(f.expected)} -> {f.fmt.format(f.got)}"
+        print(f"{'OK ' if f.ok else 'DIFF'} {f.name}: ожидалось {f.fmt.format(f.expected)} -> {f.fmt.format(f.got)}"
               + (f" ({f.note})" if f.note else ""))
 
 

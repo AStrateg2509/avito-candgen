@@ -18,7 +18,7 @@
 (в корпусе их ~18 тыс. из 189 тыс.). Их пользу на валидации нужно сверять
 по item-срезу метрики (item_in_rest / item_new): новым объявлениям они не помогают.
 
-3) Graph doc expansion (graph_expansion_texts, фишка 4) снимает это
+3) Graph doc expansion (graph_expansion_texts) снимает это
    ограничение: запросы переносятся с похожих объявлений train (dense-kNN
    внутри подкатегории) на любое объявление корпуса, в том числе новое.
 """
@@ -57,7 +57,7 @@ def memory_matrix(queries: pd.DataFrame, train: pd.DataFrame, item_ids: np.ndarr
 def graph_expansion_texts(corpus_emb: np.ndarray, corpus_mc: np.ndarray, corpus_ids: np.ndarray,
                           train_items: pd.DataFrame, train_emb: np.ndarray, train: pd.DataFrame,
                           gcfg: dict, device: torch.device, batch_size: int = 2048) -> tuple[list[str], dict]:
-    """Фишка 4: перенос запросов train на похожие объявления корпуса (graph doc expansion).
+    """Перенос запросов train на похожие объявления корпуса (graph doc expansion).
 
     Для каждого объявления корпуса ищутся k ближайших по dense-эмбеддингу
     объявлений train (из переданной части train) той же подкатегории, с

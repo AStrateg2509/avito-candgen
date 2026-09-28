@@ -150,7 +150,7 @@ class Pipeline:
                                                  items["item_location_id"].to_numpy())
         q_loc_idx = np.searchsorted(uq, queries["search_location_id"].to_numpy())
         item_loc_idx = np.searchsorted(ui, items["item_location_id"].to_numpy())
-        # Фишки 2 и 6: гео-данные для сглаживания и тип локации запроса.
+        # Гео-данные для сглаживания P_loc и тип локации запроса (город или регион).
         loc_geo = loc_prior.geo_matrices(uq, ui, items)
         q_is_agg = loc_geo["self_share"][q_loc_idx] < cfg["priors"]["loc"]["agg_self_share_max"]
         t["loc"] = time.time() - t0
@@ -183,7 +183,7 @@ class Pipeline:
         t["memory+expansion"] = time.time() - t0
         t["memory_queries"] = int((sparse["memory"].getnnz(axis=1) > 0).sum())
 
-        # Dense-модели: активные источники + модель для фишки 4 (поиск соседей).
+        # Dense-модели: активные источники + модель для переноса запросов на похожие объявления (поиск соседей).
         dense, dcfg, gcfg = {}, cfg["dense"], cfg["graph_expansion"]
         needed = list(dict.fromkeys(dcfg["active"] + ([gcfg["model"]] if gcfg["enabled"] else [])))
         for name in needed:

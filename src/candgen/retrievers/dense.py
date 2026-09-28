@@ -99,7 +99,7 @@ def _local_model_stamp(mcfg: dict) -> str:
 
 
 def train_item_embeddings(cfg: dict, name: str, model: DenseModel, train_items: pd.DataFrame) -> np.ndarray:
-    """Эмбеддинги уникальных объявлений train (для фишки 4), с кэшем на диске.
+    """Эмбеддинги уникальных объявлений train (для переноса запросов на похожие объявления), с кэшем на диске.
 
     Текст документа — тот же, что у корпуса (dense.doc_fields), поэтому
     объявления train и корпуса лежат в одном пространстве. Ключ кэша зависит

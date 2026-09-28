@@ -9,9 +9,7 @@ answer*.csv
 __pycache__/
 *.pyc
 
-# Рабочий мегапромпт — не часть решения.
+# Рабочие заметки и локальные настройки среды разработки — не часть решения.
 PLAN.md
-
-# Локальные настройки Claude Code с путями конкретной машины.
-.claude/.claudesettings.json
-.claude/settings.local.json
+.claude/
+CLAUDE.md

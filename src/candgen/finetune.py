@@ -1,4 +1,4 @@
-"""Фишка 7: дообучение multilingual-e5-small на парах «запрос → выбранное объявление».
+"""Дообучение multilingual-e5-small на парах «запрос → выбранное объявление».
 
 Пары берутся из train: на валидации — только из остатка (иначе утечка
 отложенных групп), для сабмита — из всего train. Для каждой пары подбирается
@@ -160,7 +160,7 @@ def train_model(cfg: dict, pairs: pd.DataFrame, out_dir: Path, device: torch.dev
 
 def main() -> None:
     """CLI: пары из остатка (--mode val) или всего train (--mode full) -> дообученная модель."""
-    parser = argparse.ArgumentParser(description="Фишка 7: дообучение e5-small")
+    parser = argparse.ArgumentParser(description="Дообучение e5-small")
     parser.add_argument("--config", default="configs/default.yaml")
     # val — остаток train (вариант ctx); val_cold — остаток варианта ctx_cold
     # (без строк с релевантными объявлениями валидации); full — весь train.

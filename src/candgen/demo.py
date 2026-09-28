@@ -1,4 +1,4 @@
-"""Фишка 9: интерактивная демо-страница результатов на валидации -> reports/demo.html.
+"""Интерактивная демо-страница результатов на валидации -> reports/demo.html.
 
 Для выборки val-запросов (попадания и промахи в каждой из 4 ячеек, города и
 регионы) страница показывает:
@@ -104,7 +104,7 @@ def build_payload(cfg: dict, per_bucket: int) -> dict:
 
 def main() -> None:
     """CLI: собирает reports/demo.html из шаблона и данных валидации."""
-    parser = argparse.ArgumentParser(description="Демо-страница результатов (фишка 9)")
+    parser = argparse.ArgumentParser(description="Демо-страница результатов")
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--per-bucket", type=int, default=25)
     parser.add_argument("--set", action="append", default=[], help="правка конфига a.b=значение")
