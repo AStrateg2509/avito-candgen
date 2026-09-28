@@ -49,7 +49,8 @@ pack avito-candgen_models_rerun.tar.gz "" \
 pack avito-candgen_models_research.tar.gz "s,^$S10/ce_cache,artifacts/ce_cache," \
     "$FT/e5_small_ft_val" "$FT/e5_small_ft_val_cold" "$FT/e5_small_ft_full" "$FT/crossenc_val_cold" \
     "$S10/ce_cache"
-pack avito-candgen_models_hf.tar.gz "" models/hf
+# Только hub/: рядом huggingface_hub кладёт служебные файлы (логи xet, реестр агентов), моделям они не нужны.
+pack avito-candgen_models_hf.tar.gz "" models/hf/hub
 
 cat > "$OUT/README.md" <<'EOF'
 # avito-candgen: файлы для выгрузки
