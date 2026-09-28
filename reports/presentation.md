@@ -129,4 +129,4 @@ bash scripts/install.sh && bash scripts/download_models.sh   # один раз, 
 bash scripts/run_all.sh --clean                              # с нуля, офлайн -> answer.csv
 ```
 
-Готовые модели лежат в архивах (`dist/`, см. раздел «Архивы моделей» в [`docs/TECHNICAL.md`](../docs/TECHNICAL.md)). С ними `bash scripts/run_all.sh` без `--clean` строит ответ за 4,5 мин.
+Готовые модели лежат в архивах на [Google Drive](https://drive.google.com/drive/folders/1SR7BWIuiPESjcB3aI-q1jusWh7qcbkTk?usp=sharing) (что в каком архиве — раздел «Архивы моделей» в [`docs/TECHNICAL.md`](../docs/TECHNICAL.md)). С ними `bash scripts/run_all.sh` без `--clean` строит ответ за 4,5 мин.

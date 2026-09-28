@@ -189,6 +189,8 @@ bash scripts/run_all.sh --clean   # всё с нуля офлайн -> answer.cs
 
 ### Архивы моделей
 
+Готовые архивы выложены на [Google Drive](https://drive.google.com/drive/folders/1SR7BWIuiPESjcB3aI-q1jusWh7qcbkTk?usp=sharing).
+
 Модели в git не хранятся. `bash scripts/pack_release.sh` собирает в `dist/` архивы для выгрузки: модели, код и `answer.csv`, а также контрольные суммы и пояснения в `dist/README.md`. Архивы моделей распаковываются из корня проекта командой `tar -xzf <архив>`:
 
 | архив | содержимое | размер на диске |
